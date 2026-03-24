@@ -19,12 +19,16 @@ torch>=2.1
 torchvision>=0.16
 transformers>=4.39,<5.0
 kornia>=0.7,<1.0
+modelscope>=1.14,<2.0
 
 # SVG validation / rendering helpers (recommended)
 lxml>=4.9
 cairosvg>=2.7
 svglib>=1.5
 reportlab>=4.0
+
+# PPTX export
+python-pptx>=0.6.21
 
 # NOTE:
 # SAM3 is used in local backend mode but is installed separately:

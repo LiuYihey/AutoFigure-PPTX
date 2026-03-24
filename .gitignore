@@ -1,0 +1,3 @@
+# Ignore nested git repositories
+sam3/
+models/

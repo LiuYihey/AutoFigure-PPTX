@@ -66,11 +66,13 @@ from __future__ import annotations
 
 import argparse
 import base64
+from html import escape
 import io
 import json
 import os
 import re
 import shutil
+import subprocess
 import sys
 from pathlib import Path
 from typing import Optional, List, Dict, Any, Literal
@@ -86,6 +88,12 @@ from transformers import AutoModelForImageSegmentation
 # ============================================================================
 # Provider 配置
 # ============================================================================
+
+# 保证本地自带的 sam3 包可被导入（避免未安装时的 ModuleNotFoundError）
+PROJECT_ROOT = Path(__file__).resolve().parent
+SAM3_LOCAL_PATH = PROJECT_ROOT / "sam3"
+if SAM3_LOCAL_PATH.exists():
+    sys.path.insert(0, str(SAM3_LOCAL_PATH))
 
 PROVIDER_CONFIGS = {
     "openrouter": {
@@ -105,7 +113,7 @@ PROVIDER_CONFIGS = {
     },
 }
 
-ProviderType = Literal["openrouter", "bianxie", "gemini"]
+ProviderType = str
 PlaceholderMode = Literal["none", "box", "label"]
 GEMINI_DEFAULT_IMAGE_SIZE = "4K"
 
@@ -119,6 +127,45 @@ USE_REFERENCE_IMAGE = False
 REFERENCE_IMAGE_PATH: Optional[str] = None
 
 
+def normalize_provider(provider: Optional[str], fallback: str = "bianxie") -> str:
+    provider_value = (provider or fallback).strip().lower()
+    return provider_value or fallback
+
+
+def resolve_llm_config(
+    provider: Optional[str],
+    api_key: Optional[str],
+    base_url: Optional[str],
+    model: Optional[str],
+    model_kind: Literal["image", "svg", "fix_svg"],
+    fallback_provider: str = "bianxie",
+) -> dict[str, str]:
+    resolved_provider = normalize_provider(provider, fallback_provider)
+    config = PROVIDER_CONFIGS.get(resolved_provider, {})
+    if model_kind == "image":
+        default_model_key = "default_image_model"
+    elif model_kind == "svg":
+        default_model_key = "default_svg_model"
+    else:
+        default_model_key = "default_svg_model" # fallback to svg model if fix_svg is not explicitly defined in config
+    resolved_model = model or config.get(default_model_key)
+    resolved_base_url = base_url or config.get("base_url")
+
+    if not api_key:
+        raise ValueError(f"必须提供{model_kind}链路的 api_key")
+    if not resolved_model:
+        raise ValueError(f"必须提供{model_kind}链路的 model")
+    if resolved_provider != "gemini" and not resolved_base_url:
+        raise ValueError(f"必须提供{model_kind}链路的 base_url")
+
+    return {
+        "provider": resolved_provider,
+        "api_key": api_key,
+        "base_url": resolved_base_url or "",
+        "model": resolved_model,
+    }
+
+
 # ============================================================================
 # 统一的 LLM 调用接口
 # ============================================================================
@@ -129,7 +176,7 @@ def call_llm_text(
     model: str,
     base_url: str,
     provider: ProviderType,
-    max_tokens: int = 16000,
+    max_tokens: int = 160000,
     temperature: float = 0.7,
 ) -> Optional[str]:
     """
@@ -148,11 +195,19 @@ def call_llm_text(
     Returns:
         LLM 响应文本
     """
-    if provider == "bianxie":
-        return _call_bianxie_text(prompt, api_key, model, base_url, max_tokens, temperature)
-    if provider == "gemini":
-        return _call_gemini_text(prompt, api_key, model, max_tokens, temperature)
-    return _call_openrouter_text(prompt, api_key, model, base_url, max_tokens, temperature)
+    normalized_provider = normalize_provider(provider)
+    if normalized_provider == "gemini":
+        # 如果提供了 base_url，说明使用第三方服务，应该用 OpenAI 兼容模式
+        if base_url:
+            print(f"[Gemini] 检测到自定义 base_url，使用 OpenAI 兼容模式调用: {base_url}")
+            return _call_openai_compatible_text(prompt, api_key, model, base_url, "gemini", max_tokens, temperature)
+        # 否则使用 Google 官方 SDK
+        return _call_gemini_text(prompt, api_key, model, base_url, max_tokens, temperature)
+    if normalized_provider == "openrouter":
+        return _call_openrouter_text(prompt, api_key, model, base_url, max_tokens, temperature)
+    if normalized_provider == "anthropic":
+        return _call_anthropic_text(prompt, api_key, model, base_url, max_tokens, temperature)
+    return _call_openai_compatible_text(prompt, api_key, model, base_url, normalized_provider, max_tokens, temperature)
 
 
 def call_llm_multimodal(
@@ -161,7 +216,7 @@ def call_llm_multimodal(
     model: str,
     base_url: str,
     provider: ProviderType,
-    max_tokens: int = 16000,
+    max_tokens: int = 160000,
     temperature: float = 0.7,
 ) -> Optional[str]:
     """
@@ -179,11 +234,19 @@ def call_llm_multimodal(
     Returns:
         LLM 响应文本
     """
-    if provider == "bianxie":
-        return _call_bianxie_multimodal(contents, api_key, model, base_url, max_tokens, temperature)
-    if provider == "gemini":
-        return _call_gemini_multimodal(contents, api_key, model, max_tokens, temperature)
-    return _call_openrouter_multimodal(contents, api_key, model, base_url, max_tokens, temperature)
+    normalized_provider = normalize_provider(provider)
+    if normalized_provider == "gemini":
+        # 如果提供了 base_url，说明使用第三方服务，应该用 OpenAI 兼容模式
+        if base_url:
+            print(f"[Gemini] 检测到自定义 base_url，使用 OpenAI 兼容模式调用: {base_url}")
+            return _call_openai_compatible_multimodal(contents, api_key, model, base_url, "gemini", max_tokens, temperature)
+        # 否则使用 Google 官方 SDK
+        return _call_gemini_multimodal(contents, api_key, model, base_url, max_tokens, temperature)
+    if normalized_provider == "openrouter":
+        return _call_openrouter_multimodal(contents, api_key, model, base_url, max_tokens, temperature)
+    if normalized_provider == "anthropic":
+        return _call_anthropic_multimodal(contents, api_key, model, base_url, max_tokens, temperature)
+    return _call_openai_compatible_multimodal(contents, api_key, model, base_url, normalized_provider, max_tokens, temperature)
 
 
 def call_llm_image_generation(
@@ -207,137 +270,208 @@ def call_llm_image_generation(
     Returns:
         生成的 PIL Image，失败返回 None
     """
-    if provider == "bianxie":
-        return _call_bianxie_image_generation(prompt, api_key, model, base_url, reference_image)
-    if provider == "gemini":
+    normalized_provider = normalize_provider(provider)
+    if normalized_provider == "gemini":
+        # 如果提供了 base_url，说明使用第三方服务，应该用 OpenAI 兼容模式
+        if base_url:
+            print(f"[Gemini] 检测到自定义 base_url，使用 OpenAI 兼容模式调用: {base_url}")
+            return _call_openai_compatible_image_generation(prompt, api_key, model, base_url, "gemini", reference_image)
+        # 否则使用 Google 官方 SDK
         return _call_gemini_image_generation(
             prompt=prompt,
             api_key=api_key,
             model=model,
+            base_url=base_url,
             reference_image=reference_image,
             image_size=GEMINI_DEFAULT_IMAGE_SIZE,
         )
-    return _call_openrouter_image_generation(prompt, api_key, model, base_url, reference_image)
+    if normalized_provider == "openrouter":
+        return _call_openrouter_image_generation(prompt, api_key, model, base_url, reference_image)
+    if normalized_provider == "anthropic":
+        print("[Anthropic] 暂不支持原生生图接口，尝试回退到 OpenAI 兼容模式调用")
+        return _call_openai_compatible_image_generation(prompt, api_key, model, base_url, normalized_provider, reference_image)
+    return _call_openai_compatible_image_generation(prompt, api_key, model, base_url, normalized_provider, reference_image)
 
 
 # ============================================================================
-# Bianxie Provider 实现 (使用 OpenAI SDK)
+# OpenAI-compatible Provider 实现
 # ============================================================================
 
-def _call_bianxie_text(
+def _call_openai_compatible_text(
     prompt: str,
     api_key: str,
     model: str,
     base_url: str,
-    max_tokens: int = 16000,
+    provider_label: str,
+    max_tokens: int = 160000,
     temperature: float = 0.7,
 ) -> Optional[str]:
-    """使用 OpenAI SDK 调用 Bianxie 文本接口"""
+    """使用 OpenAI SDK 调用兼容接口"""
     try:
         from openai import OpenAI
-
-        client = OpenAI(base_url=base_url, api_key=api_key)
-
+        
+        # 确保 base_url 以 /v1 结尾
+        normalized_base_url = base_url.rstrip('/')
+        if not normalized_base_url.endswith('/v1'):
+            normalized_base_url = f"{normalized_base_url}/v1"
+        
+        client = OpenAI(
+            api_key=api_key,
+            base_url=normalized_base_url,
+            timeout=600.0,    # 600 seconds total timeout
+            max_retries=0,     # disable auto retries to avoid repeated charges
+        )
+        
         completion = client.chat.completions.create(
             model=model,
             messages=[{"role": "user", "content": prompt}],
             max_tokens=max_tokens,
             temperature=temperature,
         )
-
+        
         return completion.choices[0].message.content if completion and completion.choices else None
     except Exception as e:
-        print(f"[Bianxie] API 调用失败: {e}")
+        print(f"[{provider_label}] API 调用失败: {e}")
         raise
 
 
-def _call_bianxie_multimodal(
+def _call_openai_compatible_multimodal(
     contents: List[Any],
     api_key: str,
     model: str,
     base_url: str,
-    max_tokens: int = 16000,
+    provider_label: str,
+    max_tokens: int = 160000,
     temperature: float = 0.7,
 ) -> Optional[str]:
-    """使用 OpenAI SDK 调用 Bianxie 多模态接口"""
+    """使用 OpenAI SDK 调用兼容多模态接口"""
     try:
         from openai import OpenAI
-
-        client = OpenAI(base_url=base_url, api_key=api_key)
-
+        
+        # 确保 base_url 以 /v1 结尾
+        normalized_base_url = base_url.rstrip('/')
+        if not normalized_base_url.endswith('/v1'):
+            normalized_base_url = f"{normalized_base_url}/v1"
+        
+        client = OpenAI(
+            api_key=api_key,
+            base_url=normalized_base_url,
+            timeout=600.0,    # 600 seconds total timeout
+            max_retries=0,     # disable auto retries to avoid repeated charges
+        )
+        
         message_content: List[Dict[str, Any]] = []
         for part in contents:
             if isinstance(part, str):
                 message_content.append({"type": "text", "text": part})
             elif isinstance(part, Image.Image):
                 buf = io.BytesIO()
-                part.save(buf, format='PNG')
+                image_format = 'JPEG' if provider_label == 'custom' else 'PNG'
+                image_for_upload = part.convert('RGB') if image_format == 'JPEG' else part
+                if provider_label == 'custom':
+                    image_for_upload = image_for_upload.copy()
+                    image_for_upload.thumbnail((128, 128))
+                image_for_upload.save(buf, format=image_format, quality=85)
                 image_b64 = base64.b64encode(buf.getvalue()).decode('utf-8')
+                media_type = 'image/jpeg' if image_format == 'JPEG' else 'image/png'
                 message_content.append({
                     "type": "image_url",
-                    "image_url": {"url": f"data:image/png;base64,{image_b64}"}
+                    "image_url": {"url": f"data:{media_type};base64,{image_b64}"}
                 })
-
+        
         completion = client.chat.completions.create(
             model=model,
             messages=[{"role": "user", "content": message_content}],
             max_tokens=max_tokens,
             temperature=temperature,
         )
-
+        
         return completion.choices[0].message.content if completion and completion.choices else None
     except Exception as e:
-        print(f"[Bianxie] 多模态 API 调用失败: {e}")
+        print(f"[{provider_label}] 多模态 API 调用失败: {e}")
         raise
 
 
-def _call_bianxie_image_generation(
+def _call_openai_compatible_image_generation(
     prompt: str,
     api_key: str,
     model: str,
     base_url: str,
+    provider_label: str,
     reference_image: Optional[Image.Image] = None,
 ) -> Optional[Image.Image]:
-    """使用 OpenAI SDK 调用 Bianxie 图像生成接口"""
+    """使用 OpenAI SDK 调用兼容图像生成接口"""
     try:
         from openai import OpenAI
-
-        client = OpenAI(base_url=base_url, api_key=api_key)
-
-        if reference_image is None:
-            messages = [{"role": "user", "content": prompt}]
-        else:
-            buf = io.BytesIO()
-            reference_image.save(buf, format='PNG')
-            image_b64 = base64.b64encode(buf.getvalue()).decode('utf-8')
-            message_content = [
-                {"type": "text", "text": prompt},
-                {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{image_b64}"}},
-            ]
-            messages = [{"role": "user", "content": message_content}]
-
-        completion = client.chat.completions.create(
-            model=model,
-            messages=messages,
+        import re
+        
+        # 确保 base_url 以 /v1 结尾
+        normalized_base_url = base_url.rstrip('/')
+        if not normalized_base_url.endswith('/v1'):
+            normalized_base_url = f"{normalized_base_url}/v1"
+            
+        client = OpenAI(
+            api_key=api_key,
+            base_url=normalized_base_url,
+            timeout=600.0,    # 600 seconds total timeout
+            max_retries=0,     # disable auto retries to avoid repeated charges
         )
 
-        content = completion.choices[0].message.content if completion and completion.choices else None
-
-        if not content:
+        if "gemini" in model.lower() and "preview" in model.lower():
+            print(f"[{provider_label}] 检测到 {model} 模型，使用 Chat 模式调用图像生成 API")
+            
+            content = []
+            if reference_image is not None:
+                buf = io.BytesIO()
+                reference_image.save(buf, format='PNG')
+                image_b64 = base64.b64encode(buf.getvalue()).decode('utf-8')
+                content.append({
+                    "type": "image_url",
+                    "image_url": {"url": f"data:image/png;base64,{image_b64}"}
+                })
+            
+            content.append({"type": "text", "text": prompt})
+            
+            response = client.chat.completions.create(
+                model=model,
+                messages=[{"role": "user", "content": content}]
+            )
+            
+            if response.choices and response.choices[0].message.content:
+                content_text = response.choices[0].message.content
+                match = re.search(r'!\[.*?\]\(data:image/(png|jpeg);base64,(.*?)\)', content_text)
+                if match:
+                    base64_data = match.group(2)
+                    img_data = base64.b64decode(base64_data)
+                    return Image.open(io.BytesIO(img_data)).convert("RGB")
+                else:
+                    print(f"[{provider_label}] 未找到合法的 base64 图片数据")
+                    return None
             return None
-
-        # Bianxie 返回 Markdown 格式的图片: ![text](data:image/png;base64,...)
-        pattern = r'data:image/(png|jpeg|jpg|webp);base64,([A-Za-z0-9+/=]+)'
-        match = re.search(pattern, content)
-
-        if match:
-            image_base64 = match.group(2)
-            image_data = base64.b64decode(image_base64)
-            return Image.open(io.BytesIO(image_data))
-
-        return None
+        
+        # 注意：reference_image 在标准 OpenAI images API 中不支持
+        if reference_image is not None:
+            print(f"[{provider_label}] 警告：标准图像生成 API 不支持参考图片，将忽略 reference_image")
+        
+        print(f"[{provider_label}] 调用图像生成 API: {normalized_base_url}/images/generations")
+        
+        response = client.images.generate(
+            model=model,
+            prompt=prompt,
+            n=1,
+            response_format="b64_json"
+        )
+        
+        # 处理响应
+        if hasattr(response, 'data') and response.data:
+            b64_data = response.data[0].b64_json
+            img_data = base64.b64decode(b64_data)
+            return Image.open(io.BytesIO(img_data)).convert("RGB")
+        else:
+            print(f"[{provider_label}] 生图失败，未返回图像数据")
+            return None
     except Exception as e:
-        print(f"[Bianxie] 图像生成 API 调用失败: {e}")
+        print(f"[{provider_label}] 图像生成 API 调用失败: {e}")
         raise
 
 
@@ -370,7 +504,7 @@ def _call_openrouter_text(
     api_key: str,
     model: str,
     base_url: str,
-    max_tokens: int = 16000,
+    max_tokens: int = 160000,
     temperature: float = 0.7,
 ) -> Optional[str]:
     """使用 requests 调用 OpenRouter 文本接口"""
@@ -410,7 +544,7 @@ def _call_openrouter_multimodal(
     api_key: str,
     model: str,
     base_url: str,
-    max_tokens: int = 16000,
+    max_tokens: int = 160000,
     temperature: float = 0.7,
 ) -> Optional[str]:
     """使用 requests 调用 OpenRouter 多模态接口"""
@@ -533,17 +667,132 @@ def _call_openrouter_image_generation(
 
 
 # ============================================================================
+# Anthropic Provider 实现 (使用 requests 调用原生 Messages API)
+# ============================================================================
+
+def _call_anthropic_text(
+    prompt: str,
+    api_key: str,
+    model: str,
+    base_url: str,
+    max_tokens: int = 4096,
+    temperature: float = 0.7,
+) -> Optional[str]:
+    """使用 Anthropic HTTP API 调用纯文本接口"""
+    try:
+        headers = {
+            "x-api-key": api_key,
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json"
+        }
+        
+        payload = {
+            "model": model,
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+            "messages": [
+                {"role": "user", "content": prompt}
+            ]
+        }
+        
+        endpoint = base_url.rstrip('/')
+        if not endpoint.endswith('v1/messages'):
+            endpoint = f"{endpoint}/v1/messages"
+            
+        response = requests.post(endpoint, headers=headers, json=payload)
+        response.raise_for_status()
+        result = response.json()
+        
+        if "content" in result and len(result["content"]) > 0:
+            return result["content"][0]["text"]
+        return None
+    except Exception as e:
+        print(f"[Anthropic] 文本 API 调用失败: {e}")
+        if isinstance(e, requests.exceptions.HTTPError) and e.response is not None:
+            print(f"[Anthropic] Error Response: {e.response.text}")
+        raise
+
+
+def _call_anthropic_multimodal(
+    contents: List[Any],
+    api_key: str,
+    model: str,
+    base_url: str,
+    max_tokens: int = 4096,
+    temperature: float = 0.7,
+) -> Optional[str]:
+    """使用 Anthropic HTTP API 调用多模态接口"""
+    try:
+        headers = {
+            "x-api-key": api_key,
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json"
+        }
+        
+        message_content = []
+        for part in contents:
+            if isinstance(part, str):
+                message_content.append({
+                    "type": "text",
+                    "text": part
+                })
+            elif isinstance(part, Image.Image):
+                buf = io.BytesIO()
+                part.save(buf, format='PNG')
+                image_b64 = base64.b64encode(buf.getvalue()).decode('utf-8')
+                message_content.append({
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": "image/png",
+                        "data": image_b64
+                    }
+                })
+
+        payload = {
+            "model": model,
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+            "messages": [
+                {"role": "user", "content": message_content}
+            ]
+        }
+        
+        endpoint = base_url.rstrip('/')
+        if not endpoint.endswith('v1/messages'):
+            endpoint = f"{endpoint}/v1/messages"
+            
+        response = requests.post(endpoint, headers=headers, json=payload)
+        response.raise_for_status()
+        result = response.json()
+        
+        if "content" in result and len(result["content"]) > 0:
+            return result["content"][0]["text"]
+        return None
+    except Exception as e:
+        print(f"[Anthropic] 多模态 API 调用失败: {e}")
+        if isinstance(e, requests.exceptions.HTTPError) and e.response is not None:
+            print(f"[Anthropic] Error Response: {e.response.text}")
+        raise
+
+
+# ============================================================================
 # Gemini Provider 实现 (Google 官方 SDK)
 # ============================================================================
 
-def _get_gemini_client(api_key: str):
+def _get_gemini_client(api_key: str, base_url: Optional[str] = None):
     """获取 Gemini 客户端（延迟导入，避免非 Gemini 场景强依赖）"""
     try:
         from google import genai
+        from google.genai import types
     except ImportError as e:
         raise ImportError(
             "未安装 google-genai，请执行: pip install google-genai"
         ) from e
+    if base_url:
+        # 使用自定义 API 端点（适用于第三方服务）
+        http_options = types.HttpOptions(baseUrl=base_url)
+        return genai.Client(api_key=api_key, http_options=http_options)
     return genai.Client(api_key=api_key)
 
 
@@ -622,12 +871,13 @@ def _call_gemini_text(
     prompt: str,
     api_key: str,
     model: str,
-    max_tokens: int = 16000,
+    base_url: Optional[str] = None,
+    max_tokens: int = 160000,
     temperature: float = 0.7,
 ) -> Optional[str]:
     """调用 Gemini 文本接口"""
     try:
-        client = _get_gemini_client(api_key)
+        client = _get_gemini_client(api_key, base_url)
         response = client.models.generate_content(
             model=model,
             contents=prompt,
@@ -643,12 +893,13 @@ def _call_gemini_multimodal(
     contents: List[Any],
     api_key: str,
     model: str,
-    max_tokens: int = 16000,
+    base_url: Optional[str] = None,
+    max_tokens: int = 160000,
     temperature: float = 0.7,
 ) -> Optional[str]:
     """调用 Gemini 多模态接口"""
     try:
-        client = _get_gemini_client(api_key)
+        client = _get_gemini_client(api_key, base_url)
         response = client.models.generate_content(
             model=model,
             contents=contents,
@@ -664,6 +915,7 @@ def _call_gemini_image_generation(
     prompt: str,
     api_key: str,
     model: str,
+    base_url: Optional[str] = None,
     reference_image: Optional[Image.Image] = None,
     image_size: str = GEMINI_DEFAULT_IMAGE_SIZE,
 ) -> Optional[Image.Image]:
@@ -671,7 +923,7 @@ def _call_gemini_image_generation(
     try:
         from google.genai import types
 
-        client = _get_gemini_client(api_key)
+        client = _get_gemini_client(api_key, base_url)
         config = types.GenerateContentConfig(
             image_config=types.ImageConfig(image_size=image_size),
         )
@@ -723,6 +975,17 @@ def generate_figure_from_method(
     Returns:
         生成的图片路径
     """
+    # 检查全局 output 目录中是否存在 figure.png
+    global_figure_path = Path("output/figure.png")
+    if not os.path.exists(output_path) and global_figure_path.exists():
+        import shutil
+        print(f"[{provider}] 发现全局目录下的已存在图片: {global_figure_path}，复制到当前任务目录并跳过 API 生成步骤")
+        shutil.copy(str(global_figure_path), output_path)
+        return output_path
+
+    if os.path.exists(output_path):
+        print(f"[{provider}] 发现已存在的图片: {output_path}，跳过 API 生成步骤以节省额度")
+        return output_path
     print("=" * 60)
     print("步骤一：使用 LLM 生成学术风格图片")
     print("=" * 60)
@@ -852,13 +1115,13 @@ def get_label_font(box_width: int, box_height: int) -> ImageFont.FreeTypeFont:
 def calculate_overlap_ratio(box1: dict, box2: dict) -> float:
     """
     计算两个box的重叠比例
-
+    
     Args:
         box1: 第一个box，包含 x1, y1, x2, y2
         box2: 第二个box，包含 x1, y1, x2, y2
 
     Returns:
-        重叠比例 = 交集面积 / 较小box面积
+        重叠比例 = 交集面积 / 较小box面积 (如果面积相差悬殊则返回0，避免大框吞噬小框)
     """
     # 计算交集区域
     x1 = max(box1["x1"], box2["x1"])
@@ -877,6 +1140,10 @@ def calculate_overlap_ratio(box1: dict, box2: dict) -> float:
     area2 = (box2["x2"] - box2["x1"]) * (box2["y2"] - box2["y1"])
 
     if area1 == 0 or area2 == 0:
+        return 0.0
+
+    # 如果面积相差过大（例如大框面积是小框的 4 倍以上），说明是包含/父子关系，不应合并
+    if max(area1, area2) / min(area1, area2) > 4.0:
         return 0.0
 
     # 返回交集占较小box的比例
@@ -1212,8 +1479,6 @@ def _call_sam3_roboflow_api(
     if isinstance(result, dict) and "error" in result:
         raise Exception(f"SAM3 Roboflow API 错误: {result.get('error')}")
     return result
-
-
 def segment_with_sam3(
     image_path: str,
     output_dir: str,
@@ -1223,6 +1488,7 @@ def segment_with_sam3(
     sam_backend: Literal["local", "fal", "roboflow", "api"] = "local",
     sam_api_key: Optional[str] = None,
     sam_max_masks: int = 32,
+    enable_enhanced_detection: bool = False,
 ) -> tuple[str, str, list]:
     """
     使用 SAM3 分割图片，用灰色填充+黑色边框+序号标记，生成 boxlib.json
@@ -1278,9 +1544,16 @@ def segment_with_sam3(
 
         device = "cuda" if torch.cuda.is_available() else "cpu"
         print(f"使用设备: {device}")
-        model = build_sam3_image_model(device=device, bpe_path=str(bpe_path) if bpe_path else None)
+        
+        local_sam3_ckpt = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models", "sam3", "sam3.pt")
+        if os.path.exists(local_sam3_ckpt):
+            print(f"加载本地 SAM3 权重: {local_sam3_ckpt}")
+            model = build_sam3_image_model(device=device, bpe_path=str(bpe_path) if bpe_path else None, checkpoint_path=local_sam3_ckpt, load_from_HF=False)
+        else:
+            model = build_sam3_image_model(device=device, bpe_path=str(bpe_path) if bpe_path else None)
+            
         processor = Sam3Processor(model, device=device)
-        inference_state = processor.set_image(image)
+        inference_state = processor.set_image(image.convert("RGB") if image.mode != "RGB" else image)
 
         for prompt in prompt_list:
             print(f"\n  正在检测: '{prompt}'")
@@ -1336,6 +1609,12 @@ def segment_with_sam3(
                 score_val = float(score) if score is not None else 0.0
                 if score_val >= min_score:
                     x1, y1, x2, y2 = det["x1"], det["y1"], det["x2"], det["y2"]
+                    # 过滤掉过大的框
+                    box_area = (x2 - x1) * (y2 - y1)
+                    img_area = original_size[0] * original_size[1]
+                    if img_area > 0 and (box_area / img_area) > 0.7:
+                        continue
+                        
                     all_detected_boxes.append({
                         "x1": x1, "y1": y1, "x2": x2, "y2": y2,
                         "score": score_val,
@@ -1368,6 +1647,12 @@ def segment_with_sam3(
                 score_val = float(score) if score is not None else 0.0
                 if score_val >= min_score:
                     x1, y1, x2, y2 = det["x1"], det["y1"], det["x2"], det["y2"]
+                    # 过滤掉过大的框
+                    box_area = (x2 - x1) * (y2 - y1)
+                    img_area = original_size[0] * original_size[1]
+                    if img_area > 0 and (box_area / img_area) > 0.7:
+                        continue
+                        
                     all_detected_boxes.append({
                         "x1": x1, "y1": y1, "x2": x2, "y2": y2,
                         "score": score_val,
@@ -1413,6 +1698,23 @@ def segment_with_sam3(
                 print(f"    {box_info['label']}: ({box_info['x1']}, {box_info['y1']}, {box_info['x2']}, {box_info['y2']})")
         else:
             print(f"  无需合并，所有boxes重叠比例均低于阈值")
+    
+    # === 新增：增强检测补充遗漏元素 ===
+    if enable_enhanced_detection:
+        try:
+            from enhanced_detection import enhance_sam_detection
+            print(f"\n  启用增强检测补充遗漏元素...")
+            valid_boxes = enhance_sam_detection(image, valid_boxes)
+            # 重新分配ID和label
+            for i, box in enumerate(valid_boxes):
+                box["id"] = i
+                box["label"] = f"<AF>{i + 1:02d}"
+                if "prompt" not in box:
+                    box["prompt"] = "enhanced"
+        except ImportError:
+            print(f"  警告: enhanced_detection模块未找到，跳过增强检测")
+        except Exception as e:
+            print(f"  警告: 增强检测失败: {e}")
 
     # 使用合并后的 valid_boxes 创建标记图片
     print(f"\n  绘制 samed.png (使用 {len(valid_boxes)} 个boxes)...")
@@ -1477,19 +1779,20 @@ def segment_with_sam3(
 class BriaRMBG2Remover:
     """使用 BRIA-RMBG 2.0 模型进行高质量背景抠图"""
 
-    def __init__(self, model_path: Path | str | None = None, output_dir: Path | str | None = None):
-        self.model_path = Path(model_path) if model_path else None
-        self.output_dir = Path(output_dir) if output_dir else Path("./output/icons")
-        self.output_dir.mkdir(parents=True, exist_ok=True)
+    def __init__(self, model_path: Optional[str] = None, output_dir: str = "icons"):
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.output_dir = output_dir
 
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        self.device = device
+        if not model_path:
+            local_rmbg = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models", "RMBG-2.0")
+            if os.path.exists(local_rmbg):
+                model_path = local_rmbg
 
-        if self.model_path and self.model_path.exists():
-            print(f"加载本地 RMBG 权重: {self.model_path}")
+        if model_path and os.path.exists(model_path):
+            print(f"加载本地 RMBG 权重: {model_path}")
             self.model = AutoModelForImageSegmentation.from_pretrained(
-                str(self.model_path), trust_remote_code=True,
-            ).eval().to(device)
+                str(model_path), trust_remote_code=True,
+            ).eval().to(self.device)
         else:
             print("从 HuggingFace 加载 RMBG-2.0 模型...")
             self.model = AutoModelForImageSegmentation.from_pretrained(
@@ -1601,6 +1904,10 @@ def generate_svg_template(
     base_url: str,
     provider: ProviderType,
     placeholder_mode: PlaceholderMode = "label",
+    fix_svg_api_key: Optional[str] = None,
+    fix_svg_model: Optional[str] = None,
+    fix_svg_base_url: Optional[str] = None,
+    fix_svg_provider: Optional[str] = None,
 ) -> str:
     """
     使用多模态 LLM 生成 SVG 代码
@@ -1624,15 +1931,25 @@ def generate_svg_template(
     figure_width, figure_height = figure_img.size
     print(f"原图尺寸: {figure_width} x {figure_height}")
 
-    # 基础 prompt
-    base_prompt = f"""编写svg代码来实现像素级别的复现这张图片（除了图标用相同大小的矩形占位符填充之外其他文字和组件(尤其是箭头样式)都要保持一致（即灰色矩形覆盖的内容就是图标））
+    # 基础 prompt - 让 LLM 完整重绘 SVG（文字/框线/箭头/布局全部用 SVG 元素），只有图标用占位符代替
+    base_prompt = f"""You are an expert SVG coder. Your task is to faithfully recreate the ENTIRE figure as a pure, fully-editable SVG — no embedded PNG images.
 
 CRITICAL DIMENSION REQUIREMENT:
-- The original image has dimensions: {figure_width} x {figure_height} pixels
-- Your SVG MUST use these EXACT dimensions to ensure accurate icon placement:
-  - Set viewBox="0 0 {figure_width} {figure_height}"
-  - Set width="{figure_width}" height="{figure_height}"
-- DO NOT scale or resize the SVG
+- The original image has dimensions: {figure_width} x {figure_height} pixels.
+- Your SVG MUST use these EXACT dimensions: viewBox="0 0 {figure_width} {figure_height}" and width="{figure_width}" height="{figure_height}".
+- DO NOT scale or resize the SVG.
+
+CORE REQUIREMENT — PURE SVG (VERY IMPORTANT):
+- Recreate ALL visual elements using native SVG elements: <rect>, <text>, <line>, <path>, <circle>, <polyline>, <g>, etc.
+- This includes: section boxes/frames, all text labels, titles, arrows, connectors, background panels, annotation text, legends.
+- Do NOT embed any PNG or raster image as a background layer (no <image href="data:...">, no base64 blobs).
+- The output SVG must be fully editable — every element independently selectable and movable.
+
+HANDLING ICONS (VERY IMPORTANT):
+- The figure contains illustration icons (complex cartoon/vector icons).
+- Do NOT attempt to draw these complex icons in SVG — it is impossible to reproduce them accurately.
+- Instead, mark each icon area with a gray placeholder <g> block. The real icon PNG will be inserted later.
+- Image 2 (the SAM3-masked image) shows exactly where each icon is — those gray/masked rectangles are the icon positions.
 """
 
     if placeholder_mode == "box":
@@ -1649,60 +1966,115 @@ Use these coordinates to accurately position your icon placeholders in the SVG.
 Please output ONLY the SVG code, starting with <svg and ending with </svg>. Do not include any explanation or markdown formatting."""
 
     elif placeholder_mode == "label":
-        # label 模式：要求占位符样式与 samed.png 一致
-        prompt_text = base_prompt + """
-PLACEHOLDER STYLE REQUIREMENT:
-Look at the second image (samed.png) - each icon area is marked with a gray rectangle (#808080), black border, and a centered label like <AF>01, <AF>02, etc.
+        # label 模式：提供图标坐标，LLM 输出完整 SVG（文字/框线/箭头全部用 SVG 元素画出），图标位置用占位符
+        with open(boxlib_path, 'r', encoding='utf-8') as f:
+            boxlib_data = json.load(f)
 
-Your SVG placeholders MUST match this exact style:
-- Rectangle with fill="#808080" and stroke="black" stroke-width="2"
-- Centered white text showing the same label (<AF>01, <AF>02, etc.)
-- Wrap each placeholder in a <g> element with id matching the label (e.g., id="AF01")
+        # 构建坐标列表，告诉 LLM 图标精确位置
+        coord_list = []
+        for box in boxlib_data.get("boxes", []):
+            label = box.get("label", f"<AF>{box.get('id', 0) + 1:02d}")
+            coord_list.append(f"  {label}: x1={box['x1']}, y1={box['y1']}, x2={box['x2']}, y2={box['y2']}")
+        coords_text = "\n".join(coord_list)
 
-Example placeholder structure:
+        prompt_text = base_prompt + f"""
+ICON PLACEHOLDER COORDINATES (VERY IMPORTANT):
+For each icon listed below, place a gray placeholder <g> block at EXACTLY those coordinates.
+Do NOT draw what is inside these icon areas — just place the placeholder.
+
+{coords_text}
+
+For EACH icon, use this placeholder format (example for <AF>01 at x1=1302, y1=199, x2=1351, y2=273):
 <g id="AF01">
-  <rect x="100" y="50" width="80" height="80" fill="#808080" stroke="black" stroke-width="2"/>
-  <text x="140" y="90" text-anchor="middle" dominant-baseline="middle" fill="white" font-size="14">&lt;AF&gt;01</text>
+  <rect x="1302" y="199" width="49" height="74" fill="#808080" stroke="black" stroke-width="2"/>
+  <text x="1326.5" y="236" text-anchor="middle" dominant-baseline="middle" fill="white" font-size="14">&lt;AF&gt;01</text>
 </g>
 
-Please output ONLY the SVG code, starting with <svg and ending with </svg>. Do not include any explanation or markdown formatting."""
+OUTPUT FORMAT:
+- Output ONLY the complete SVG code, starting with <svg and ending with </svg>
+- NO <image> tags, NO base64, NO embedded PNG
+- All text, frames, boxes, arrows, connectors must be drawn with SVG elements
+- Icon areas must use the gray placeholder <g> blocks above
+- No markdown fences, no explanations"""
+
+        print("  [label 模式] LLM 完整重绘 SVG，图标区域用占位符代替")
+
+        contents: List[Any] = [prompt_text, figure_img, samed_img]
+
+        print(f"发送多模态请求到: {base_url}")
+
+        svg_code = call_llm_multimodal(
+            contents=contents,
+            api_key=api_key,
+            model=model,
+            base_url=base_url,
+            provider=provider,
+            max_tokens=65536,
+        )
+
+        if not svg_code:
+            raise Exception('API 响应中没有内容，生成 SVG 失败。')
+
+        svg_code = extract_svg_code(svg_code)
+        if not svg_code:
+            raise Exception('无法从多模态 API 响应中提取有效的 SVG 代码。')
+
+        print(f"  [label 模式] SVG 拼装完成，尺寸={len(svg_code)} 字节")
+
+        output_path = Path(output_path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+
+        svg_code = check_and_fix_svg(
+            svg_code=svg_code,
+            api_key=fix_svg_api_key or api_key,
+            model=fix_svg_model or model,
+            base_url=fix_svg_base_url or base_url,
+            provider=fix_svg_provider or provider,
+            output_dir=str(output_path.parent),
+        )
+
+        with open(output_path, 'w', encoding='utf-8') as f:
+            f.write(svg_code)
+
+        print(f"SVG 模板已保存: {output_path}")
+        return str(output_path)
 
     else:  # none 模式
         prompt_text = base_prompt + """
 Please output ONLY the SVG code, starting with <svg and ending with </svg>. Do not include any explanation or markdown formatting."""
 
-    contents = [prompt_text, figure_img, samed_img]
+    contents: List[Any] = [prompt_text, figure_img, samed_img]
 
     print(f"发送多模态请求到: {base_url}")
-
+    
     content = call_llm_multimodal(
         contents=contents,
         api_key=api_key,
         model=model,
         base_url=base_url,
         provider=provider,
-        max_tokens=50000,
+        max_tokens=65536,
     )
 
     if not content:
-        raise Exception('API 响应中没有内容')
+        raise Exception('API 响应中没有内容，生成 SVG 失败。')
 
     svg_code = extract_svg_code(content)
 
     if not svg_code:
-        raise Exception('无法从响应中提取 SVG 代码')
-
-    # 步骤 4.5：SVG 语法验证和修复
-    svg_code = check_and_fix_svg(
-        svg_code=svg_code,
-        api_key=api_key,
-        model=model,
-        base_url=base_url,
-        provider=provider,
-    )
+        raise Exception('无法从多模态 API 的响应中提取出有效的 SVG 代码。')
 
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    svg_code = check_and_fix_svg(
+        svg_code=svg_code,
+        api_key=fix_svg_api_key or api_key,
+        model=fix_svg_model or model,
+        base_url=fix_svg_base_url or base_url,
+        provider=fix_svg_provider or provider,
+        output_dir=str(output_path.parent),
+    )
 
     with open(output_path, 'w', encoding='utf-8') as f:
         f.write(svg_code)
@@ -1731,6 +2103,62 @@ def extract_svg_code(content: str) -> Optional[str]:
     return None
 
 
+def create_local_fallback_svg_template(
+    figure_path: str,
+    boxlib_path: str,
+    output_path: str,
+    placeholder_mode: PlaceholderMode = "label",
+) -> str:
+    figure_img = Image.open(figure_path)
+    figure_width, figure_height = figure_img.size
+
+    with open(boxlib_path, 'r', encoding='utf-8') as f:
+        boxlib = json.load(f)
+
+    # 基层用 samed.png（图标区域已被遮盖），避免原始图标出现在底层
+    samed_path_local = str(Path(figure_path).parent / 'samed.png')
+    base_img_path = samed_path_local if Path(samed_path_local).exists() else figure_path
+    with open(base_img_path, 'rb') as f:
+        base_img_b64 = base64.b64encode(f.read()).decode('utf-8')
+
+    svg_parts = [
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{figure_width}" height="{figure_height}" viewBox="0 0 {figure_width} {figure_height}">',
+        f'<image href="data:image/png;base64,{base_img_b64}" x="0" y="0" width="{figure_width}" height="{figure_height}" />',
+    ]
+
+    if placeholder_mode in ("label", "box"):
+        for box in boxlib.get("boxes", []):
+            label = box.get("label", f'<AF>{box.get("id", 0) + 1:02d}')
+            label_clean = label.replace('<', '').replace('>', '')
+            x1 = box["x1"]
+            y1 = box["y1"]
+            x2 = box["x2"]
+            y2 = box["y2"]
+            width = x2 - x1
+            height = y2 - y1
+            center_x = x1 + width / 2
+            center_y = y1 + height / 2
+            font_size = max(12, min(24, int(min(width, height) * 0.35)))
+            svg_parts.append(
+                f'<g id="{label_clean}">'
+                f'<rect x="{x1}" y="{y1}" width="{width}" height="{height}" fill="#808080" stroke="black" stroke-width="2"/>'
+                f'<text x="{center_x}" y="{center_y}" text-anchor="middle" dominant-baseline="middle" fill="white" font-size="{font_size}">{escape(label)}</text>'
+                f'</g>'
+            )
+
+    svg_parts.append('</svg>')
+    svg_code = ''.join(svg_parts)
+
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    with open(output_path, 'w', encoding='utf-8') as f:
+        f.write(svg_code)
+
+    print(f"本地兜底 SVG 模板已保存: {output_path}")
+    return str(output_path)
+
+
 # ============================================================================
 # 步骤 4.5：SVG 语法验证和修复
 # ============================================================================
@@ -1739,8 +2167,19 @@ def validate_svg_syntax(svg_code: str) -> tuple[bool, list[str]]:
     """使用 lxml 解析验证 SVG 语法"""
     try:
         from lxml import etree
-        etree.fromstring(svg_code.encode('utf-8'))
-        return True, []
+        # 使用独立 XMLParser 实例，error_log 仅包含本次解析的错误，避免全局累积
+        parser = etree.XMLParser(recover=False)
+        try:
+            etree.fromstring(svg_code.encode('utf-8'), parser)
+            return True, []
+        except etree.XMLSyntaxError as e:
+            errors = []
+            # 读 parser.error_log（仅本次解析），而非 e.error_log（全局累积）
+            for error in parser.error_log:
+                errors.append(f"行 {error.line}, 列 {error.column}: {error.message}")
+            if not errors:
+                errors.append(f"行 {e.lineno}, 列 {e.offset}: {e.msg}")
+            return False, errors
     except ImportError:
         print("  警告: lxml 未安装，使用内置 xml.etree 进行验证")
         try:
@@ -1750,17 +2189,82 @@ def validate_svg_syntax(svg_code: str) -> tuple[bool, list[str]]:
         except ET.ParseError as e:
             return False, [f"XML 解析错误: {str(e)}"]
     except Exception as e:
-        from lxml import etree
-        if isinstance(e, etree.XMLSyntaxError):
-            errors = []
-            error_log = e.error_log
-            for error in error_log:
-                errors.append(f"行 {error.line}, 列 {error.column}: {error.message}")
-            if not errors:
-                errors.append(f"行 {e.lineno}, 列 {e.offset}: {e.msg}")
-            return False, errors
-        else:
-            return False, [f"解析错误: {str(e)}"]
+        return False, [f"解析错误: {str(e)}"]
+
+
+def _rule_based_svg_fix(svg_code: str) -> tuple[str, list[str]]:
+    """规则修复器：在 LLM Agent 介入前，用正则自动修复常见的 XML/SVG 属性语法错误。
+    
+    主要处理：
+    1. AttValue 错误：属性值中未转义的 & < 字符（仅限双引号属性值）
+    2. 属性值内部未转义的双引号
+    
+    关键约束：使用 [^"<>]* 代替 (.*?) + re.DOTALL，避免跨标签边界误匹配。
+    返回：(修复后的 svg_code, 应用的修复描述列表)
+    """
+    import re
+
+    applied = []
+
+    # ---- 1. 修复双引号属性值中裸露的 &（未写成 &amp;）----
+    # 用 [^">]* 限定匹配范围，不会跨越 " 或 > 边界
+    def _fix_amp_in_dquote_attr(m: re.Match) -> str:
+        value = m.group(1)
+        fixed = re.sub(r'&(?!(amp|lt|gt|quot|apos|#\d+|#x[0-9a-fA-F]+);)', '&amp;', value)
+        return f'="{fixed}"'
+
+    new_code = re.sub(r'="([^">]*)"', _fix_amp_in_dquote_attr, svg_code)
+    if new_code != svg_code:
+        applied.append("修复双引号属性值中裸露的 & → &amp;")
+        svg_code = new_code
+
+    # ---- 2. 修复单引号属性值中裸露的 & ----
+    def _fix_amp_in_squote_attr(m: re.Match) -> str:
+        value = m.group(1)
+        fixed = re.sub(r'&(?!(amp|lt|gt|quot|apos|#\d+|#x[0-9a-fA-F]+);)', '&amp;', value)
+        return f"='{fixed}'"
+
+    new_code = re.sub(r"='([^'>]*)'", _fix_amp_in_squote_attr, svg_code)
+    if new_code != svg_code:
+        applied.append("修复单引号属性值中裸露的 & → &amp;")
+        svg_code = new_code
+
+    # ---- 3. 修复双引号属性值中裸露的 < ----
+    def _fix_lt_in_dquote_attr(m: re.Match) -> str:
+        value = m.group(1)
+        fixed = value.replace('<', '&lt;')
+        return f'="{fixed}"'
+
+    new_code = re.sub(r'="([^">]*)"', _fix_lt_in_dquote_attr, svg_code)
+    if new_code != svg_code:
+        applied.append("修复双引号属性值中裸露的 < → &lt;")
+        svg_code = new_code
+
+    # ---- 4. 修复属性值内部未转义的双引号（在双引号属性值内出现 "）----
+    # 识别模式：attrname="val"extra"val2" — 内部出现多余的 "
+    # 关键约束：内嵌的 " 后面不能紧跟 \s*\w+=（那是下一个属性，不是嵌入引号）
+    def _fix_unescaped_dquote(m: re.Match) -> str:
+        attr_name = m.group(1)
+        value = m.group(2)
+        # 二次检查：value 中确实有 " 且该 " 不是下一属性的开头
+        if '"' not in value:
+            return m.group(0)
+        # 如果每个内嵌 " 后面都紧跟 \s*\w+= 则说明是正常的相邻属性，不修复
+        parts = value.split('"')
+        for part in parts[1:]:  # parts[0] 是 " 前面的内容
+            # 若紧接的内容看起来像 " attrname= 则跳过
+            stripped = part.lstrip()
+            if re.match(r'[\w][\w\-:]*\s*=', stripped):
+                return m.group(0)  # 不修复，是正常属性边界
+        fixed = value.replace('"', '&quot;')
+        return f'{attr_name}="{fixed}"'
+
+    new_code = re.sub(r'([\w][\w\-:]*)="([^"<>]*(?:"[^"<>]*)*)"(?=[\s/>])', _fix_unescaped_dquote, svg_code)
+    if new_code != svg_code:
+        applied.append("修复属性值内部未转义的双引号 → &quot;")
+        svg_code = new_code
+
+    return svg_code, applied
 
 
 def fix_svg_with_llm(
@@ -1770,80 +2274,284 @@ def fix_svg_with_llm(
     model: str,
     base_url: str,
     provider: ProviderType,
-    max_retries: int = 3,
+    output_dir: str,
+    max_retries: int = 8,
 ) -> str:
-    """使用 LLM 修复 SVG 语法错误"""
+    """使用 LLM Function Calling Agent 修复 SVG 语法错误"""
+    import os
+    import json
+    from pathlib import Path
+    from openai import OpenAI
+    
     print("\n  " + "-" * 50)
-    print("  检测到 SVG 语法错误，调用 LLM 修复...")
+    print("  检测到 SVG 语法错误，启动 Agentic 修复流程...")
     print("  " + "-" * 50)
-    for err in errors:
-        print(f"    {err}")
 
-    current_svg = svg_code
-    current_errors = errors
+    # 1. 保存到输出目录
+    temp_path = str(Path(output_dir) / "broken_template.svg")
+    with open(temp_path, 'w', encoding='utf-8') as f:
+        f.write(svg_code)
+        
+    print(f"  [Agent] 已将包含错误的 SVG 保存至: {temp_path}")
 
-    for attempt in range(max_retries):
-        print(f"\n  修复尝试 {attempt + 1}/{max_retries}...")
+    # 2. 定义工具
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "read_file",
+                "description": "读取文件的指定行数，会返回带有行号的代码。当你根据错误信息中的行号排查问题时，使用此工具读取报错位置前后的代码。",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "file_path": {"type": "string", "description": "文件路径"},
+                        "start_line": {"type": "integer", "description": "起始行号（从1开始）"},
+                        "end_line": {"type": "integer", "description": "结束行号。如果为-1表示读取到末尾"}
+                    },
+                    "required": ["file_path", "start_line", "end_line"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "replace_text",
+                "description": "替换文件中的错误代码片段。注意：old_text必须与文件中的内容完全一致（不包含行号前缀），否则会替换失败。",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "file_path": {"type": "string", "description": "文件路径"},
+                        "old_text": {"type": "string", "description": "出错的原始XML文本（切记不要带行号前缀，必须是文件里的原样内容）"},
+                        "new_text": {"type": "string", "description": "修复后的正确XML文本"}
+                    },
+                    "required": ["file_path", "old_text", "new_text"]
+                }
+            }
+        }
+    ]
 
-        error_list = "\n".join([f"  - {err}" for err in current_errors])
-        prompt = f"""The following SVG code has XML syntax errors detected by an XML parser. Please fix ALL the errors and return valid SVG code.
-
-SYNTAX ERRORS DETECTED:
-{error_list}
-
-ORIGINAL SVG CODE:
-```xml
-{current_svg}
-```
-
-IMPORTANT INSTRUCTIONS:
-1. Fix all XML syntax errors (unclosed tags, invalid attributes, unescaped characters, etc.)
-2. Ensure the output is valid XML that can be parsed by lxml
-3. Keep all the visual elements and structure intact
-4. Return ONLY the fixed SVG code, starting with <svg and ending with </svg>
-5. Do NOT include any markdown formatting, explanation, or code blocks - just the raw SVG code"""
-
+    def _read_file_tool(file_path: str, start_line: int, end_line: int) -> str:
         try:
-            content = call_llm_text(
-                prompt=prompt,
-                api_key=api_key,
-                model=model,
-                base_url=base_url,
-                provider=provider,
-                max_tokens=16000,
-                temperature=0.3,
-            )
-
-            if not content:
-                print("    响应为空")
-                continue
-
-            fixed_svg = extract_svg_code(content)
-
-            if not fixed_svg:
-                print("    无法从响应中提取 SVG 代码")
-                continue
-
-            is_valid, new_errors = validate_svg_syntax(fixed_svg)
-
-            if is_valid:
-                print("    修复成功！SVG 语法验证通过")
-                return fixed_svg
-            else:
-                print(f"    修复后仍有 {len(new_errors)} 个错误:")
-                for err in new_errors[:3]:
-                    print(f"      {err}")
-                if len(new_errors) > 3:
-                    print(f"      ... 还有 {len(new_errors) - 3} 个错误")
-                current_svg = fixed_svg
-                current_errors = new_errors
-
+            with open(file_path, 'r', encoding='utf-8') as f:
+                lines = f.read().splitlines()
+            s = max(0, start_line - 1)
+            e = len(lines) if end_line == -1 else min(len(lines), end_line)
+            # 限制最多读取 50 行，防止超长行撑爆上下文
+            if e - s > 50:
+                e = s + 50
+            
+            MAX_LINE_LEN = 500  # 每行最多显示 500 字符，超长截断
+            output = []
+            for i in range(s, e):
+                line = lines[i]
+                if len(line) > MAX_LINE_LEN:
+                    line = line[:MAX_LINE_LEN] + f"...[截断, 原始长度={len(lines[i])}字符]"
+                output.append(f"{i+1}| {line}")
+            return "\n".join(output)
         except Exception as e:
-            print(f"    修复过程出错: {e}")
-            continue
+            return f"读取文件失败: {e}"
 
-    print(f"  警告: 达到最大重试次数 ({max_retries})，返回最后一次的 SVG 代码")
-    return current_svg
+    def _strip_line_prefixes(text: str) -> str:
+        """自动剥离 read_file 返回的行号前缀（如 '1| ', '23| '），Agent 有时会误带入 old_text"""
+        lines = text.splitlines()
+        stripped = []
+        for line in lines:
+            # 匹配 "数字| " 前缀格式
+            import re as _re
+            stripped.append(_re.sub(r'^\d+\| ?', '', line))
+        return "\n".join(stripped)
+
+    def _replace_text_tool(file_path: str, old_text: str, new_text: str) -> str:
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                content = f.read()
+            if old_text not in content:
+                # 尝试自动剥离行号前缀后再匹配
+                stripped_old = _strip_line_prefixes(old_text)
+                if stripped_old != old_text and stripped_old in content:
+                    old_text = stripped_old
+                    print(f"    [Tool] 自动剥离了 old_text 中的行号前缀")
+                else:
+                    return "错误：找不到要替换的旧文本old_text。请确保缩进、换行和内容与原文件一模一样（不要带行号前缀）。"
+            new_content = content.replace(old_text, new_text)
+            with open(file_path, 'w', encoding='utf-8') as f:
+                f.write(new_content)
+            
+            is_valid, new_errors = validate_svg_syntax(new_content)
+            if is_valid:
+                return "文件替换成功。最新验证结果：✓ 验证通过！"
+            else:
+                err_msg = "\n".join([f"  - {err}" for err in new_errors[:5]])
+                return f"文件替换成功。但最新验证结果：仍有语法错误！\n{err_msg}"
+        except Exception as e:
+            return f"修改文件失败: {e}"
+
+    # 3. 初始化 OpenAI Client
+    if not base_url:
+        if normalize_provider(provider) == "gemini":
+            raise Exception("Fail Fast 触发: Agentic 修复流程强依赖 Function Calling。原生 Gemini SDK 暂未适配，请使用带有 base_url 的 OpenAI 兼容格式调用！")
+        normalized_base_url = "https://api.openai.com/v1"
+    else:
+        normalized_base_url = base_url.rstrip('/')
+        if not normalized_base_url.endswith('/v1'):
+            normalized_base_url = f"{normalized_base_url}/v1"
+        
+    client = OpenAI(
+        api_key=api_key,
+        base_url=normalized_base_url,
+        timeout=600.0,
+        max_retries=0,
+    )
+
+    error_msg = "\n".join([f"  - {err}" for err in errors])
+    system_prompt = f"""你是一个顶级的 XML/SVG 语法修复 Agent。
+你的任务是通过使用工具来修复 SVG 文件中的语法错误。
+
+工作流程：
+1. 检查用户的错误报告和文件路径。
+2. 使用 `read_file` 工具读取报错行附近的上下文（建议读取报错行前后各10行）。
+3. 发现错误后，使用 `replace_text` 工具修复错误。
+4. 观察 `replace_text` 的返回结果，如果提示验证通过，即可停止调用工具并回复"修复完成"；如果提示仍有错误，请继续读取并修复。
+
+严格遵守：
+- 绝对不要修改与语法错误无关的任何属性（特别是 <path> 的 d 属性、坐标数值或 Base64 数据）。
+- `old_text` 必须是文件的**原始内容**，绝对不能包含 `read_file` 返回的行号前缀（如 `1| ` `2| ` 这样的前缀）。
+- `read_file` 返回的每行格式是 `行号| 内容`，你只需要取 `| ` 之后的内容作为 `old_text`。
+- 例如：`read_file` 返回 `5| <rect x="10"/>` ，则 `old_text` 应填 `<rect x="10"/>` 而非 `5| <rect x="10"/>`。"""
+
+    user_prompt = f"文件路径：{temp_path}\n当前解析出来的语法错误有：\n{error_msg}\n请开始修复！"
+
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt}
+    ]
+
+    print(f"  [Agent] 开始循环修复流程，最大允许交互 {max_retries} 轮...")
+
+    # 保留 system + 首条 user 消息作为固定前缀，其余动态追加
+    _init_messages = messages[:]
+    MAX_HISTORY_ROUNDS = 6  # 最多保留最近 6 轮工具交互，防止上下文无限膨胀
+
+    for loop_idx in range(1, max_retries + 1):
+        # 裁剪上下文：保留前 2 条初始消息 + 最近若干轮
+        if len(messages) > 2 + MAX_HISTORY_ROUNDS * 2:
+            messages = _init_messages[:2] + messages[-(MAX_HISTORY_ROUNDS * 2):]
+        try:
+            print(f"    [Round {loop_idx}] Agent 思考中...")
+            completion = client.chat.completions.create(
+                model=model,
+                messages=messages,
+                tools=tools,
+                tool_choice="auto",
+                temperature=0.0
+            )
+            
+            response_message = completion.choices[0].message
+            
+            # 处理可能为空的 content
+            if response_message.content is None:
+                response_message.content = ""
+                
+            messages.append(response_message)
+            
+            if response_message.tool_calls:
+                for tool_call in response_message.tool_calls:
+                    try:
+                        args = json.loads(tool_call.function.arguments)
+                    except json.JSONDecodeError:
+                        result = "错误：传入的参数不是合法的 JSON。"
+                        messages.append({"role": "tool", "tool_call_id": tool_call.id, "name": tool_call.function.name, "content": result})
+                        continue
+
+                    if tool_call.function.name == "read_file":
+                        s_line = args.get("start_line", 1)
+                        e_line = args.get("end_line", -1)
+                        print(f"    [Tool] 调用 read_file: start={s_line}, end={e_line}")
+                        result = _read_file_tool(args.get("file_path", temp_path), s_line, e_line)
+                        messages.append({"role": "tool", "tool_call_id": tool_call.id, "name": tool_call.function.name, "content": result})
+                        
+                    elif tool_call.function.name == "replace_text":
+                        print(f"    [Tool] 调用 replace_text 进行修复...")
+                        result = _replace_text_tool(args.get("file_path", temp_path), args.get("old_text", ""), args.get("new_text", ""))
+                        print(f"    [Result] 替换结果: {result.split('。')[0]}")
+                        if "验证通过" in result:
+                            print(f"    [Success] SVG 语法已完全修复！")
+                        messages.append({"role": "tool", "tool_call_id": tool_call.id, "name": tool_call.function.name, "content": result})
+                continue
+            else:
+                # Agent 认为完成了，或者没有调用 tool
+                with open(temp_path, 'r', encoding='utf-8') as f:
+                    final_svg = f.read()
+                is_valid, final_errors = validate_svg_syntax(final_svg)
+                if is_valid:
+                    print("  [Agent] 修复流程正常结束，验证通过！")
+                    os.remove(temp_path)
+                    return final_svg
+                else:
+                    print(f"  [Agent] Agent 停止调用工具，但文件仍有错误: {final_errors[0]}")
+                    messages.append({"role": "user", "content": f"文件仍然有错误：{final_errors[0]}，请继续调用工具修复！"})
+                    continue
+                    
+        except Exception as e:
+            err_str = str(e).lower()
+            is_timeout = any(kw in err_str for kw in ("timed out", "timeout", "read timeout", "connect timeout"))
+            print(f"    [Agent] 运行出错: {e}")
+            if is_timeout and loop_idx < max_retries:
+                print(f"    [Agent] 检测到超时，将重试 (Round {loop_idx + 1})...")
+                continue
+            break
+
+    # 循环结束后的兜底检查
+    with open(temp_path, 'r', encoding='utf-8') as f:
+        final_svg = f.read()
+    is_valid, final_errors = validate_svg_syntax(final_svg)
+    
+    if is_valid:
+        try:
+            os.remove(temp_path)
+        except Exception:
+            pass
+        return final_svg
+    
+    print(f"  [Agent] 修复失败，保留错误文件用于调试: {temp_path}")
+    raise Exception(f"Fail Fast 触发: Agent 修复达到最大轮数 ({max_retries})，SVG 依然存在语法错误: {final_errors[0]}")
+
+
+def _detect_truncated_svg(svg_code: str, errors: list[str]) -> bool:
+    """检测 SVG 是否因 LLM 输出截断导致结构不完整（如 base64 属性值未闭合）。
+    
+    典型症状：错误列号 >= 行长度（解析器越过了行末），且行末不以 > 或 " 结尾。
+    这类错误无法通过 Agent 工具修复，需重新生成 SVG。
+    """
+    import re
+    lines = svg_code.splitlines()
+    for err in errors:
+        m = re.match(r'行 (\d+), 列 (\d+):', err)
+        if m:
+            line_no = int(m.group(1))
+            col_no = int(m.group(2))
+            # 截断特征：
+            # 1. 必须是 AttValue 错误（引号不匹配）
+            # 2. 列号超过 100（排除 </g> 等结构错误在行末的误判）
+            # 3. 列号 >= 行实际长度
+            is_attvalue_err = 'AttValue' in err or 'EntityRef' in err
+            if is_attvalue_err and col_no > 100 and line_no <= len(lines):
+                line_len = len(lines[line_no - 1])
+                if col_no >= line_len:
+                    return True
+    # 额外检查：SVG 中存在未闭合的 href/src 属性（含 base64）
+    # 格式固定为 href="data:... 或 href='data:...，引号是属性名后面紧跟的字符
+    for line in lines:
+        for attr in ['href', 'src']:
+            for quote in ['"', "'"]:
+                pat = f'{attr}={quote}data:'
+                idx = line.find(pat)
+                if idx >= 0:
+                    val_start = idx + len(attr) + 1  # 跳过 attr= ，指向开引号
+                    closing = line.find(quote, val_start + 1)
+                    if closing < 0:
+                        return True  # 属性值未闭合，SVG 被截断
+    return False
 
 
 def check_and_fix_svg(
@@ -1852,6 +2560,7 @@ def check_and_fix_svg(
     model: str,
     base_url: str,
     provider: ProviderType,
+    output_dir: str,
 ) -> str:
     """检查 SVG 语法并在需要时调用 LLM 修复"""
     print("\n" + "-" * 50)
@@ -1865,6 +2574,38 @@ def check_and_fix_svg(
         return svg_code
     else:
         print(f"  发现 {len(errors)} 个语法错误")
+
+        # 截断检测：LLM 输出被 max_tokens 截断，属性值不完整，Agent 无法修复
+        if _detect_truncated_svg(svg_code, errors):
+            # 无论如何先把截断的 SVG 保存，方便调试且不浪费 API 调用结果
+            import os as _os
+            _os.makedirs(output_dir, exist_ok=True)
+            truncated_path = _os.path.join(output_dir, "truncated_template.svg")
+            with open(truncated_path, 'w', encoding='utf-8') as _f:
+                _f.write(svg_code)
+            print(f"  [截断检测] 已保存截断的 SVG 至: {truncated_path}")
+            raise Exception(
+                "SVG 生成失败：LLM 输出被截断（疑似 max_tokens 不足），属性值不完整，无法通过 Agent 修复。"
+                "请检查 max_tokens 参数或简化图片内容后重试。"
+            )
+
+        # 规则修复预处理：先尝试用正则自动修复 AttValue / 未转义字符等常见错误
+        rule_fixed, rule_applied = _rule_based_svg_fix(svg_code)
+        if rule_applied:
+            print(f"  [规则修复] 应用了 {len(rule_applied)} 项规则修复:")
+            for desc in rule_applied:
+                print(f"    - {desc}")
+            rule_valid, rule_errors = validate_svg_syntax(rule_fixed)
+            if rule_valid:
+                print("  [规则修复] 验证通过，无需启动 LLM Agent！")
+                return rule_fixed
+            else:
+                print(f"  [规则修复] 规则修复后仍有 {len(rule_errors)} 个错误，继续启动 LLM Agent...")
+                svg_code = rule_fixed
+                errors = rule_errors
+        else:
+            print("  [规则修复] 无适用规则，直接启动 LLM Agent...")
+
         fixed_svg = fix_svg_with_llm(
             svg_code=svg_code,
             errors=errors,
@@ -1872,6 +2613,7 @@ def check_and_fix_svg(
             model=model,
             base_url=base_url,
             provider=provider,
+            output_dir=output_dir,
         )
         return fixed_svg
 
@@ -1942,10 +2684,13 @@ def replace_icons_in_svg(
     match_by_label: bool = True,
 ) -> str:
     """
-    将透明背景图标替换到 SVG 中的占位符
+    将透明背景图标替换到 SVG 中的占位符（内联替换）。
+
+    每个占位符 <g id="AFxx"> 直接被替换为对应的 <image> 标签，
+    保持原始 SVG 结构完整可编辑。底层如存在 base64 背景图会被自动清除。
 
     Args:
-        template_svg_path: SVG 模板路径
+        template_svg_path: 模板 SVG 路径
         icon_infos: 图标信息列表
         output_path: 输出路径
         scale_factors: 坐标缩放因子
@@ -1963,12 +2708,23 @@ def replace_icons_in_svg(
     with open(template_svg_path, 'r', encoding='utf-8') as f:
         svg_content = f.read()
 
-    for icon_info in icon_infos:
-        label = icon_info.get("label", "")
-        label_clean = icon_info.get("label_clean", label.replace("<", "").replace(">", ""))
-        nobg_path = icon_info["nobg_path"]
+    # 防御性清除：删除可能存在的 base64 背景图片元素（LLM 有时会忽略 no-image 指令）
+    svg_content = re.sub(
+        r'<image\s[^>]*href=["\']data:image/[^"\']+["\'][^>]*/?>',
+        '',
+        svg_content,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
 
-        # 读取图标并转为 base64
+    for icon_info in icon_infos:
+        label = icon_info.get("label", f"<AF>{icon_info['id'] + 1:02d}")
+        label_clean = icon_info.get("label_clean", label.replace("<", "").replace(">", ""))
+        nobg_path = icon_info.get("nobg_path")
+
+        if not nobg_path or not os.path.exists(nobg_path):
+            print(f"警告: 找不到图标文件 {nobg_path}")
+            continue
+
         icon_img = Image.open(nobg_path)
         buf = io.BytesIO()
         icon_img.save(buf, format="PNG")
@@ -1977,161 +2733,116 @@ def replace_icons_in_svg(
         replaced = False
 
         if match_by_label and label:
-            # 方式1：查找 id="AF01" 的 <g> 元素
+            # 方式1：查找 id="AF01" 的 <g> 元素，直接替换为 <image>
             g_pattern = rf'<g[^>]*\bid=["\']?{re.escape(label_clean)}["\']?[^>]*>[\s\S]*?</g>'
             g_match = re.search(g_pattern, svg_content, re.IGNORECASE)
 
             if g_match:
                 g_content = g_match.group(0)
 
-                # 提取 <g> 元素的 transform="translate(x, y)" （如果存在）
-                # 这处理 LLM 生成 <g id="AF01" transform="translate(100, 50)"><rect x="0" y="0" ...> 的情况
-                g_tag_match = re.match(r'<g[^>]*>', g_content, re.IGNORECASE)
+                # 解析 <g> 的 transform translate 属性
                 translate_x, translate_y = 0.0, 0.0
+                g_tag_match = re.match(r'<g[^>]*>', g_content, re.IGNORECASE)
                 if g_tag_match:
                     g_tag = g_tag_match.group(0)
-                    # 匹配 transform="translate(100, 50)" 或 transform="translate(100 50)"
-                    transform_pattern = r'transform=["\'][^"\']*translate\s*\(\s*([\d.-]+)[\s,]+([\d.-]+)\s*\)'
-                    transform_match = re.search(transform_pattern, g_tag, re.IGNORECASE)
+                    transform_match = re.search(
+                        r'transform=["\'][^"\']*translate\s*\(\s*([\d.-]+)[\s,]+([\d.-]+)\s*\)',
+                        g_tag, re.IGNORECASE)
                     if transform_match:
                         translate_x = float(transform_match.group(1))
                         translate_y = float(transform_match.group(2))
+                        print(f"  {label}: 检测到 <g> transform: translate({translate_x}, {translate_y})")
 
                 # 从 <g> 中提取 <rect> 的尺寸
                 rect_patterns = [
-                    # x="100" y="50" width="80" height="80"
                     r'<rect[^>]*\bx=["\']?([\d.]+)["\']?[^>]*\by=["\']?([\d.]+)["\']?[^>]*\bwidth=["\']?([\d.]+)["\']?[^>]*\bheight=["\']?([\d.]+)["\']?',
-                    # width="80" height="80" x="100" y="50" (属性顺序不同)
                     r'<rect[^>]*\bwidth=["\']?([\d.]+)["\']?[^>]*\bheight=["\']?([\d.]+)["\']?[^>]*\bx=["\']?([\d.]+)["\']?[^>]*\by=["\']?([\d.]+)["\']?',
                 ]
-
                 rect_info = None
                 for rp in rect_patterns:
                     rect_match = re.search(rp, g_content, re.IGNORECASE)
                     if rect_match:
                         groups = rect_match.groups()
-                        if len(groups) == 4:
-                            if 'width' in rp[:50]:  # 第二种模式
-                                width, height, x, y = groups
-                            else:
-                                x, y, width, height = groups
-                            rect_info = {
-                                'x': float(x),
-                                'y': float(y),
-                                'width': float(width),
-                                'height': float(height)
-                            }
-                            break
+                        if 'width' in rp[:50]:
+                            width, height, x, y = groups
+                        else:
+                            x, y, width, height = groups
+                        rect_info = {'x': float(x) + translate_x, 'y': float(y) + translate_y,
+                                     'width': float(width), 'height': float(height)}
+                        break
 
                 if rect_info:
-                    # 将 <g> 的 transform translate 值加到 rect 坐标上
-                    x = rect_info['x'] + translate_x
-                    y = rect_info['y'] + translate_y
-                    width, height = rect_info['width'], rect_info['height']
-
-                    # 如果应用了 transform，输出提示
-                    if translate_x != 0 or translate_y != 0:
-                        print(f"  {label}: 检测到 <g> transform: translate({translate_x}, {translate_y})")
-
-                    # 创建 image 标签替换整个 <g>
-                    image_tag = f'<image id="icon_{label_clean}" x="{x}" y="{y}" width="{width}" height="{height}" href="data:image/png;base64,{icon_b64}" preserveAspectRatio="xMidYMid meet"/>'
+                    x, y, w, h = rect_info['x'], rect_info['y'], rect_info['width'], rect_info['height']
+                    image_tag = (f'<image id="icon_{label_clean}" x="{x}" y="{y}" '
+                                 f'width="{w}" height="{h}" '
+                                 f'href="data:image/png;base64,{icon_b64}" '
+                                 f'preserveAspectRatio="xMidYMid meet"/>')
                     svg_content = svg_content.replace(g_content, image_tag)
-                    print(f"  {label}: 替换成功 (序号匹配 <g>) at ({x}, {y}) size {width}x{height}")
+                    print(f"  {label}: 替换成功 (序号匹配 <g>) at ({x}, {y}) size {w}x{h}")
                     replaced = True
 
-            # 方式2：查找包含 label 文本的 <text> 元素附近的 <rect>
+            # 方式2：查找包含 label 文本的 <text> 附近的 <rect>
             if not replaced:
-                # 查找包含 <AF>01 或 &lt;AF&gt;01 的文本
                 text_patterns = [
                     rf'<text[^>]*>[^<]*{re.escape(label)}[^<]*</text>',
                     rf'<text[^>]*>[^<]*&lt;AF&gt;{label_clean[2:]}[^<]*</text>',
                 ]
-
                 for tp in text_patterns:
                     text_match = re.search(tp, svg_content, re.IGNORECASE)
                     if text_match:
-                        # 找到文本，向前查找最近的 <rect>
-                        text_pos = text_match.start()
-                        preceding_svg = svg_content[:text_pos]
-
-                        # 查找最后一个 <rect>
+                        preceding_svg = svg_content[:text_match.start()]
                         rect_matches = list(re.finditer(r'<rect[^>]*/?\s*>', preceding_svg, re.IGNORECASE))
                         if rect_matches:
-                            last_rect = rect_matches[-1]
-                            rect_content = last_rect.group(0)
-
-                            # 提取 rect 的属性
-                            x_match = re.search(r'\bx=["\']?([\d.]+)', rect_content)
-                            y_match = re.search(r'\by=["\']?([\d.]+)', rect_content)
-                            w_match = re.search(r'\bwidth=["\']?([\d.]+)', rect_content)
-                            h_match = re.search(r'\bheight=["\']?([\d.]+)', rect_content)
-
-                            if all([x_match, y_match, w_match, h_match]):
-                                x = float(x_match.group(1))
-                                y = float(y_match.group(1))
-                                width = float(w_match.group(1))
-                                height = float(h_match.group(1))
-
-                                # 替换 rect 和 text
-                                image_tag = f'<image id="icon_{label_clean}" x="{x}" y="{y}" width="{width}" height="{height}" href="data:image/png;base64,{icon_b64}" preserveAspectRatio="xMidYMid meet"/>'
-
-                                # 删除 text
+                            rect_content = rect_matches[-1].group(0)
+                            x_m = re.search(r'\bx=["\']?([\d.]+)', rect_content)
+                            y_m = re.search(r'\by=["\']?([\d.]+)', rect_content)
+                            w_m = re.search(r'\bwidth=["\']?([\d.]+)', rect_content)
+                            h_m = re.search(r'\bheight=["\']?([\d.]+)', rect_content)
+                            if all([x_m, y_m, w_m, h_m]):
+                                x, y = float(x_m.group(1)), float(y_m.group(1))
+                                w, h = float(w_m.group(1)), float(h_m.group(1))
+                                image_tag = (f'<image id="icon_{label_clean}" x="{x}" y="{y}" '
+                                             f'width="{w}" height="{h}" '
+                                             f'href="data:image/png;base64,{icon_b64}" '
+                                             f'preserveAspectRatio="xMidYMid meet"/>')
                                 svg_content = svg_content.replace(text_match.group(0), '')
-                                # 替换 rect
                                 svg_content = svg_content.replace(rect_content, image_tag, 1)
-
-                                print(f"  {label}: 替换成功 (序号匹配 <text>) at ({x}, {y}) size {width}x{height}")
+                                print(f"  {label}: 替换成功 (序号匹配 <text>) at ({x}, {y}) size {w}x{h}")
                                 replaced = True
                                 break
 
-        # 回退：使用坐标匹配
+        # 回退：坐标匹配，直接替换 <rect>
         if not replaced:
             orig_x1, orig_y1 = icon_info["x1"], icon_info["y1"]
-            orig_width, orig_height = icon_info["width"], icon_info["height"]
-
             x1 = orig_x1 * scale_x
             y1 = orig_y1 * scale_y
-            width = orig_width * scale_x
-            height = orig_height * scale_y
-
-            image_tag = f'<image id="icon_{label_clean}" x="{x1:.1f}" y="{y1:.1f}" width="{width:.1f}" height="{height:.1f}" href="data:image/png;base64,{icon_b64}" preserveAspectRatio="xMidYMid meet"/>'
-
+            w = icon_info["width"] * scale_x
+            h = icon_info["height"] * scale_y
             x1_int, y1_int = int(round(x1)), int(round(y1))
+            image_tag = (f'<image id="icon_{label_clean}" x="{x1:.1f}" y="{y1:.1f}" '
+                         f'width="{w:.1f}" height="{h:.1f}" '
+                         f'href="data:image/png;base64,{icon_b64}" '
+                         f'preserveAspectRatio="xMidYMid meet"/>')
 
-            # 精确匹配
             rect_pattern = rf'<rect[^>]*x=["\']?{x1_int}(?:\.0)?["\']?[^>]*y=["\']?{y1_int}(?:\.0)?["\']?[^>]*/?\s*>'
             if re.search(rect_pattern, svg_content):
                 svg_content = re.sub(rect_pattern, image_tag, svg_content, count=1)
                 print(f"  {label}: 替换成功 (坐标精确匹配) at ({x1:.1f}, {y1:.1f})")
                 replaced = True
             else:
-                # 近似匹配
                 tolerance = 10
-                found = False
                 for dx in range(-tolerance, tolerance+1, 2):
                     for dy in range(-tolerance, tolerance+1, 2):
-                        search_x = x1_int + dx
-                        search_y = y1_int + dy
-                        rect_pattern = rf'<rect[^>]*x=["\']?{search_x}(?:\.0)?["\']?[^>]*y=["\']?{search_y}(?:\.0)?["\']?[^>]*(?:fill=["\']?(?:#[0-9A-Fa-f]{{3,6}}|gray|grey)["\']?|stroke=["\']?(?:black|#000|#000000)["\']?)[^>]*/?\s*>'
-                        if re.search(rect_pattern, svg_content, re.IGNORECASE):
-                            svg_content = re.sub(rect_pattern, image_tag, svg_content, count=1, flags=re.IGNORECASE)
+                        rp = rf'<rect[^>]*x=["\']?{x1_int+dx}(?:\.0)?["\']?[^>]*y=["\']?{y1_int+dy}(?:\.0)?["\']?[^>]*(?:fill=["\']?(?:#[0-9A-Fa-f]{{3,6}}|gray|grey)["\']?|stroke=["\']?(?:black|#000|#000000)["\']?)[^>]*/?\s*>'
+                        if re.search(rp, svg_content, re.IGNORECASE):
+                            svg_content = re.sub(rp, image_tag, svg_content, count=1, flags=re.IGNORECASE)
                             print(f"  {label}: 替换成功 (坐标近似匹配) at ({x1:.1f}, {y1:.1f})")
-                            found = True
                             replaced = True
                             break
-                    if found:
+                    if replaced:
                         break
 
         if not replaced:
-            # 追加到 SVG 末尾
-            orig_x1, orig_y1 = icon_info["x1"], icon_info["y1"]
-            orig_width, orig_height = icon_info["width"], icon_info["height"]
-            x1 = orig_x1 * scale_x
-            y1 = orig_y1 * scale_y
-            width = orig_width * scale_x
-            height = orig_height * scale_y
-
-            image_tag = f'<image id="icon_{label_clean}" x="{x1:.1f}" y="{y1:.1f}" width="{width:.1f}" height="{height:.1f}" href="data:image/png;base64,{icon_b64}" preserveAspectRatio="xMidYMid meet"/>'
             svg_content = svg_content.replace('</svg>', f'  {image_tag}\n</svg>')
             print(f"  {label}: 追加到 SVG at ({x1:.1f}, {y1:.1f}) (未找到匹配的占位符)")
 
@@ -2174,28 +2885,147 @@ def validate_base64_images(svg_code: str, expected_count: int) -> tuple[bool, st
     return True, f"base64 图片验证通过: {actual_count} 张图片"
 
 
+def _print_cairo_installation_guide():
+    """打印 Cairo 库安装指南"""
+    print("\n" + "=" * 60)
+    print("Cairo 库未正确安装或配置")
+    print("=" * 60)
+    print("\n请在 conda 环境中安装 Cairo 库：")
+    print("\n  conda activate figure")
+    print("  conda install -c conda-forge cairo")
+    print("  pip install cairosvg")
+    print("\n或者使用以下命令一键安装：")
+    print("  conda install -c conda-forge cairo cairosvg")
+    print("\n安装完成后重新运行程序。")
+    print("=" * 60 + "\n")
+
+
 def svg_to_png(svg_path: str, output_path: str, scale: float = 1.0) -> Optional[str]:
     """将 SVG 转换为 PNG"""
     try:
+        # Windows 系统特殊处理：配置 Cairo DLL 路径
+        if os.name == 'nt':
+            dll_dirs = []
+            
+            # 1. 尝试当前 conda 环境
+            conda_prefix = os.environ.get('CONDA_PREFIX')
+            if conda_prefix:
+                dll_dirs.append(os.path.join(conda_prefix, 'Library', 'bin'))
+            
+            # 2. 尝试 sys.prefix（Python 安装目录）
+            dll_dirs.append(os.path.join(sys.prefix, 'Library', 'bin'))
+            
+            # 3. 尝试从环境变量获取 conda 默认环境
+            conda_default_env = os.environ.get('CONDA_DEFAULT_ENV')
+            if conda_default_env:
+                # 尝试从 CONDA_EXE 推断 conda 根目录
+                conda_exe = os.environ.get('CONDA_EXE')
+                if conda_exe:
+                    conda_root = os.path.dirname(os.path.dirname(conda_exe))
+                    env_path = os.path.join(conda_root, 'envs', conda_default_env, 'Library', 'bin')
+                    if os.path.isdir(env_path):
+                        dll_dirs.append(env_path)
+            
+            valid_dll_dirs = []
+            for dll_dir in dll_dirs:
+                if os.path.isdir(dll_dir):
+                    # 检查是否真的包含 cairo DLL
+                    cairo_dll_exists = any(
+                        os.path.exists(os.path.join(dll_dir, dll_name))
+                        for dll_name in ['cairo.dll', 'libcairo-2.dll', 'cairo-2.dll']
+                    )
+                    if cairo_dll_exists:
+                        valid_dll_dirs.append(dll_dir)
+                        print(f"  找到 Cairo DLL 目录: {dll_dir}")
+                    
+                    # 添加到 DLL 搜索路径
+                    try:
+                        os.add_dll_directory(dll_dir)
+                    except (AttributeError, FileNotFoundError, OSError):
+                        current_path = os.environ.get('PATH', '')
+                        if dll_dir not in current_path.split(os.pathsep):
+                            os.environ['PATH'] = dll_dir + os.pathsep + current_path
+            
+            if valid_dll_dirs:
+                os.environ['CAIROCFFI_DLL_DIRECTORIES'] = ';'.join(dict.fromkeys(valid_dll_dirs))
+            else:
+                print("  警告: 未找到 Cairo DLL 文件")
+        
         import cairosvg
         cairosvg.svg2png(url=svg_path, write_to=output_path, scale=scale)
         return output_path
-    except ImportError:
-        print("  警告: cairosvg 未安装，尝试使用其他方法")
+        
+    except ImportError as e:
+        print(f"  错误: cairosvg 未安装 ({e})")
+        _print_cairo_installation_guide()
+        return None
+        
+    except Exception as e:
+        error_msg = str(e)
+        
+        # 检查是否是 Cairo 库缺失错误
+        is_cairo_missing = 'cairo' in error_msg.lower() and ('library' in error_msg.lower() or 'dll' in error_msg.lower() or 'found' in error_msg.lower())
+        
+        if is_cairo_missing:
+            print(f"  错误: Cairo 库未找到")
+            print(f"  详细信息: {error_msg}")
+        else:
+            print(f"  警告: cairosvg 转换失败 ({e})")
+
+        # 尝试 svglib + reportlab 作为 fallback（无需 Cairo）
         try:
             from svglib.svglib import svg2rlg
             from reportlab.graphics import renderPM
+            print("  尝试使用 svglib + reportlab 作为备用转换器 ...")
             drawing = svg2rlg(svg_path)
+            if drawing is None:
+                raise ValueError("svg2rlg 返回 None，SVG 解析失败")
+            if scale != 1.0:
+                drawing.width *= scale
+                drawing.height *= scale
+                drawing.renderSVG = None
+                drawing.transform = (scale, 0, 0, scale, 0, 0)
             renderPM.drawToFile(drawing, output_path, fmt="PNG")
-            return output_path
+            if os.path.exists(output_path):
+                print("  ✓ svglib 转换成功")
+                return output_path
         except ImportError:
-            print("  警告: svglib 也未安装，无法转换 SVG 到 PNG")
-            return None
-        except Exception as e:
-            print(f"  警告: svglib 转换失败: {e}")
-            return None
-    except Exception as e:
-        print(f"  警告: cairosvg 转换失败: {e}")
+            print("  svglib/reportlab 未安装，跳过此备用方案")
+        except Exception as svglib_err:
+            print(f"  svglib 转换失败: {svglib_err}")
+
+        # 尝试在 conda 环境中运行 cairosvg（旧有流程，保留兼容性）
+        conda_exe = os.environ.get('CONDA_EXE')
+        conda_env_name = os.environ.get('CONDA_DEFAULT_ENV') or os.path.basename(sys.prefix.rstrip('\\/'))
+        
+        if conda_exe and conda_env_name and conda_env_name.lower() != 'base':
+            try:
+                print("  尝试使用独立进程运行 cairosvg ...")
+                cmd = [
+                    conda_exe,
+                    'run',
+                    '-n',
+                    conda_env_name,
+                    'python',
+                    '-c',
+                    (
+                        'import cairosvg; '
+                        f'cairosvg.svg2png(url={svg_path!r}, write_to={output_path!r}, scale={scale!r})'
+                    ),
+                ]
+                result = subprocess.run(cmd, check=False, capture_output=True, text=True)
+                if result.returncode == 0 and os.path.exists(output_path):
+                    print("  ✓ 独立进程转换成功")
+                    return output_path
+                else:
+                    if result.stderr:
+                        print(f"  独立进程错误: {result.stderr[:200]}")
+            except Exception as subprocess_error:
+                print(f"  独立进程失败: {subprocess_error}")
+        
+        if is_cairo_missing:
+            _print_cairo_installation_guide()
+        print(f"  最终错误: SVG 转 PNG 失败")
         return None
 
 
@@ -2210,6 +3040,10 @@ def optimize_svg_with_llm(
     provider: ProviderType,
     max_iterations: int = 2,
     skip_base64_validation: bool = False,
+    fix_svg_api_key: Optional[str] = None,
+    fix_svg_model: Optional[str] = None,
+    fix_svg_base_url: Optional[str] = None,
+    fix_svg_provider: Optional[str] = None,
 ) -> str:
     """
     使用 LLM 优化 SVG，使其与原图更加对齐
@@ -2321,7 +3155,7 @@ Please carefully compare and check the following **TWO MAJOR ASPECTS with EIGHT 
                 model=model,
                 base_url=base_url,
                 provider=provider,
-                max_tokens=50000,
+                max_tokens=4096,
                 temperature=0.3,
             )
 
@@ -2342,10 +3176,10 @@ Please carefully compare and check the following **TWO MAJOR ASPECTS with EIGHT 
                 optimized_svg = fix_svg_with_llm(
                     svg_code=optimized_svg,
                     errors=errors,
-                    api_key=api_key,
-                    model=model,
-                    base_url=base_url,
-                    provider=provider,
+                    api_key=fix_svg_api_key or api_key,
+                    model=fix_svg_model or model,
+                    base_url=fix_svg_base_url or base_url,
+                    provider=fix_svg_provider or provider,
                 )
 
             if not skip_base64_validation:
@@ -2390,12 +3224,9 @@ Please carefully compare and check the following **TWO MAJOR ASPECTS with EIGHT 
 def method_to_svg(
     method_text: str,
     output_dir: str = "./output",
-    api_key: str = None,
-    base_url: str = None,
-    provider: ProviderType = "bianxie",
-    image_gen_model: str = None,
-    svg_gen_model: str = None,
-    sam_prompts: str = "icon",
+    resume_dir: Optional[str] = None,
+    input_image: Optional[str] = None,
+    sam_prompts: str = "icon, flowchart, illustration, person, robot, machine, device, animal, diagram",
     min_score: float = 0.5,
     sam_backend: Literal["local", "fal", "roboflow", "api"] = "local",
     sam_api_key: Optional[str] = None,
@@ -2405,6 +3236,19 @@ def method_to_svg(
     placeholder_mode: PlaceholderMode = "label",
     optimize_iterations: int = 2,
     merge_threshold: float = 0.9,
+    enable_enhanced_detection: bool = True,
+    image_api_key: Optional[str] = None,
+    image_base_url: Optional[str] = None,
+    image_provider: Optional[str] = "gemini",
+    image_model: Optional[str] = None,
+    svg_api_key: Optional[str] = None,
+    svg_base_url: Optional[str] = None,
+    svg_provider: Optional[str] = "gemini",
+    svg_model: Optional[str] = None,
+    fix_svg_api_key: Optional[str] = None,
+    fix_svg_base_url: Optional[str] = None,
+    fix_svg_provider: Optional[str] = "gemini",
+    fix_svg_model: Optional[str] = None,
 ) -> dict:
     """
     完整流程：Paper Method → SVG with Icons
@@ -2412,39 +3256,81 @@ def method_to_svg(
     Args:
         method_text: Paper method 文本内容
         output_dir: 输出目录
-        api_key: API Key
-        base_url: API base URL
-        provider: API 提供商
-        image_gen_model: 生图模型
-        svg_gen_model: SVG 生成模型
         sam_prompts: SAM3 文本提示，支持逗号分隔的多个prompt（如 "icon,diagram,arrow"）
         min_score: SAM3 最低置信度
         sam_backend: SAM3 后端（local/fal/roboflow/api）
         sam_api_key: SAM3 API Key（api 模式使用）
         sam_max_masks: SAM3 API 最大 masks 数（api 模式使用）
-        rmbg_model_path: RMBG 模型路径
-        stop_after: 执行到指定步骤后停止
-        placeholder_mode: 占位符模式
-            - "none": 无特殊样式
-            - "box": 传入 boxlib 坐标
-            - "label": 灰色填充+黑色边框+序号标签（推荐）
-        optimize_iterations: 步骤 4.6 优化迭代次数（0 表示跳过优化）
+        rmbg_model_path: RMBG 模型本地路径（可选）
+        stop_after: 调试用，在第几步后停止
+        placeholder_mode: "label" | "box" | "empty"
+        optimize_iterations: 优化 SVG 的次数
         merge_threshold: Box合并阈值，重叠比例超过此值则合并（0表示不合并，默认0.9）
-
-    Returns:
-        结果字典
+        image_api_key: 生图链路 API Key
+        image_base_url: 生图链路 API base URL
+        image_provider: 生图链路 provider
+        image_model: 生图链路模型
+        svg_api_key: SVG链路 API Key
+        svg_base_url: SVG链路 API base URL
+        svg_provider: SVG链路 provider
+        svg_model: SVG链路模型
+        fix_svg_api_key: SVG修复链路 API Key
+        fix_svg_base_url: SVG修复链路 API base URL
+        fix_svg_provider: SVG修复链路 provider
+        fix_svg_model: SVG修复链路模型
     """
-    if not api_key:
-        raise ValueError("必须提供 api_key")
+    out_path = Path(output_dir)
+    out_path.mkdir(parents=True, exist_ok=True)
 
-    # 获取默认配置
-    config = PROVIDER_CONFIGS[provider]
-    if base_url is None:
-        base_url = config["base_url"]
-    if image_gen_model is None:
-        image_gen_model = config["default_image_model"]
-    if svg_gen_model is None:
-        svg_gen_model = config["default_svg_model"]
+    # 如果提供了 resume_dir，将已有的中间产物复制到当前输出目录，以便 skip 逻辑生效
+    if resume_dir:
+        import shutil as _shutil
+        resume_path = Path(resume_dir)
+        if resume_path.exists():
+            print(f"  [Resume] 从 {resume_path} 复制已有产物...")
+            # 复制单文件产物
+            for fname in ["figure.png", "samed.png", "boxlib.json"]:
+                src = resume_path / fname
+                dst = out_path / fname
+                if src.exists() and not dst.exists():
+                    _shutil.copy2(str(src), str(dst))
+                    print(f"  [Resume] 复制: {fname}")
+            # 复制 icons/ 目录
+            src_icons = resume_path / "icons"
+            dst_icons = out_path / "icons"
+            if src_icons.exists() and not dst_icons.exists():
+                _shutil.copytree(str(src_icons), str(dst_icons))
+                print(f"  [Resume] 复制: icons/ ({len(list(src_icons.glob('*.png')))} 文件)")
+        else:
+            print(f"  [Resume] 警告: resume_dir 不存在: {resume_path}，忽略")
+
+    # 1. 解析模型配置
+    # 如果提供了 input_image，则跳过图像生成，不需要 image 链路的 API key
+    _skip_image_gen = bool(input_image and Path(input_image).is_file())
+    if _skip_image_gen:
+        image_config = {"provider": "none", "api_key": "", "base_url": "", "model": ""}
+    else:
+        image_config = resolve_llm_config(
+            provider=image_provider,
+            api_key=image_api_key,
+            base_url=image_base_url,
+            model=image_model,
+            model_kind="image"
+        )
+    svg_config = resolve_llm_config(
+        provider=svg_provider,
+        api_key=svg_api_key,
+        base_url=svg_base_url,
+        model=svg_model,
+        model_kind="svg"
+    )
+    fix_svg_config = resolve_llm_config(
+        provider=fix_svg_provider,
+        api_key=fix_svg_api_key,
+        base_url=fix_svg_base_url,
+        model=fix_svg_model,
+        model_kind="fix_svg"
+    )
 
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -2452,10 +3338,11 @@ def method_to_svg(
     print("\n" + "=" * 60)
     print("Paper Method 到 SVG 图标替换流程 (Label 模式增强版 + Box合并)")
     print("=" * 60)
-    print(f"Provider: {provider}")
+    print(f"Image Provider: {image_config['provider']}")
+    print(f"SVG Provider: {svg_config['provider']}")
     print(f"输出目录: {output_dir}")
-    print(f"生图模型: {image_gen_model}")
-    print(f"SVG模型: {svg_gen_model}")
+    print(f"生图模型: {image_config['model']}")
+    print(f"SVG模型: {svg_config['model']}")
     print(f"SAM提示词: {sam_prompts}")
     print(f"最低置信度: {min_score}")
     sam_backend_value = "fal" if sam_backend == "api" else sam_backend
@@ -2468,16 +3355,27 @@ def method_to_svg(
     print(f"Box合并阈值: {merge_threshold}")
     print("=" * 60)
 
-    # 步骤一：生成图片
+    # 步骤一：生成图片（如果提供了 input_image 则直接复制；若 figure.png 已存在则跳过）
     figure_path = output_dir / "figure.png"
-    generate_figure_from_method(
-        method_text=method_text,
-        output_path=str(figure_path),
-        api_key=api_key,
-        model=image_gen_model,
-        base_url=base_url,
-        provider=provider,
-    )
+    if input_image and Path(input_image).is_file() and not figure_path.exists():
+        import shutil as _shutil2
+        _shutil2.copy2(input_image, str(figure_path))
+        print("\n" + "=" * 60)
+        print(f"步骤一：[跳过] 使用上传图片 {input_image}，已复制到 {figure_path}")
+        print("=" * 60)
+    elif figure_path.exists():
+        print("\n" + "=" * 60)
+        print("步骤一：[跳过] 检测到 figure.png 已存在，跳过图片生成步骤")
+        print("=" * 60)
+    else:
+        generate_figure_from_method(
+            method_text=method_text,
+            output_path=str(figure_path),
+            api_key=image_config["api_key"],
+            model=image_config["model"],
+            base_url=image_config["base_url"],
+            provider=image_config["provider"],
+        )
 
     if stop_after == 1:
         print("\n" + "=" * 60)
@@ -2493,17 +3391,31 @@ def method_to_svg(
             "final_svg_path": None,
         }
 
-    # 步骤二：SAM3 分割（包含Box合并）
-    samed_path, boxlib_path, valid_boxes = segment_with_sam3(
-        image_path=str(figure_path),
-        output_dir=str(output_dir),
-        text_prompts=sam_prompts,
-        min_score=min_score,
-        merge_threshold=merge_threshold,
-        sam_backend=sam_backend_value,
-        sam_api_key=sam_api_key,
-        sam_max_masks=sam_max_masks,
-    )
+    # 步骤二：SAM3 分割（如果 samed.png + boxlib.json 已存在则跳过）
+    samed_path_candidate = output_dir / "samed.png"
+    boxlib_path_candidate = output_dir / "boxlib.json"
+    if samed_path_candidate.exists() and boxlib_path_candidate.exists():
+        print("\n" + "=" * 60)
+        print("步骤二：[跳过] 检测到 samed.png + boxlib.json 已存在，跳过 SAM3 分割步骤")
+        print("=" * 60)
+        samed_path = str(samed_path_candidate)
+        boxlib_path = str(boxlib_path_candidate)
+        with open(boxlib_path, 'r', encoding='utf-8') as f:
+            boxlib_data = json.load(f)
+        valid_boxes = boxlib_data.get("boxes", [])
+        print(f"  从缓存读取到 {len(valid_boxes)} 个 boxes")
+    else:
+        samed_path, boxlib_path, valid_boxes = segment_with_sam3(
+            image_path=str(figure_path),
+            output_dir=str(output_dir),
+            text_prompts=sam_prompts,
+            min_score=min_score,
+            merge_threshold=merge_threshold,
+            sam_backend=sam_backend_value,
+            sam_api_key=sam_api_key,
+            sam_max_masks=sam_max_masks,
+            enable_enhanced_detection=enable_enhanced_detection,
+        )
 
     if len(valid_boxes) == 0:
         print("\n警告: 没有检测到有效的图标，流程终止")
@@ -2532,13 +3444,41 @@ def method_to_svg(
             "final_svg_path": None,
         }
 
-    # 步骤三：裁切 + 去背景
-    icon_infos = crop_and_remove_background(
-        image_path=str(figure_path),
-        boxlib_path=boxlib_path,
-        output_dir=str(output_dir),
-        rmbg_model_path=rmbg_model_path,
-    )
+    # 步骤三：裁切 + 去背景（如果 icons/ 文件夹已存在 nobg 文件则跳过）
+    icons_dir_candidate = output_dir / "icons"
+    nobg_files = list(icons_dir_candidate.glob("*_nobg.png")) if icons_dir_candidate.exists() else []
+    if nobg_files:
+        print("\n" + "=" * 60)
+        print(f"步骤三：[跳过] 检测到 icons/ 已存在 {len(nobg_files)} 个 _nobg.png 文件，跳过 RMBG 步骤")
+        print("=" * 60)
+        # 从文件系统重建 icon_infos
+        with open(boxlib_path, 'r', encoding='utf-8') as f:
+            boxlib_data = json.load(f)
+        icon_infos = []
+        for box_info in boxlib_data.get("boxes", []):
+            box_id = box_info["id"]
+            label = box_info.get("label", f"<AF>{box_id + 1:02d}")
+            label_clean = label.replace("<", "").replace(">", "")
+            x1, y1, x2, y2 = box_info["x1"], box_info["y1"], box_info["x2"], box_info["y2"]
+            crop_path = icons_dir_candidate / f"icon_{label_clean}.png"
+            nobg_path = icons_dir_candidate / f"icon_{label_clean}_nobg.png"
+            icon_infos.append({
+                "id": box_id,
+                "label": label,
+                "label_clean": label_clean,
+                "x1": x1, "y1": y1, "x2": x2, "y2": y2,
+                "width": x2 - x1, "height": y2 - y1,
+                "crop_path": str(crop_path),
+                "nobg_path": str(nobg_path),
+            })
+            print(f"  {label}: 使用缓存 -> {nobg_path}")
+    else:
+        icon_infos = crop_and_remove_background(
+            image_path=str(figure_path),
+            boxlib_path=boxlib_path,
+            output_dir=str(output_dir),
+            rmbg_model_path=rmbg_model_path,
+        )
 
     if stop_after == 3:
         print("\n" + "=" * 60)
@@ -2561,11 +3501,15 @@ def method_to_svg(
         samed_path=samed_path,
         boxlib_path=boxlib_path,
         output_path=str(template_svg_path),
-        api_key=api_key,
-        model=svg_gen_model,
-        base_url=base_url,
-        provider=provider,
+        api_key=svg_config["api_key"],
+        model=svg_config["model"],
+        base_url=svg_config["base_url"],
+        provider=svg_config["provider"],
         placeholder_mode=placeholder_mode,
+        fix_svg_api_key=fix_svg_config["api_key"],
+        fix_svg_model=fix_svg_config["model"],
+        fix_svg_base_url=fix_svg_config["base_url"],
+        fix_svg_provider=fix_svg_config["provider"],
     )
 
     # 步骤 4.6：LLM 优化 SVG 模板（可配置迭代次数，0 表示跳过）
@@ -2575,12 +3519,16 @@ def method_to_svg(
         samed_path=samed_path,
         final_svg_path=str(template_svg_path),
         output_path=str(optimized_template_path),
-        api_key=api_key,
-        model=svg_gen_model,
-        base_url=base_url,
-        provider=provider,
+        api_key=svg_config["api_key"],
+        model=svg_config["model"],
+        base_url=svg_config["base_url"],
+        provider=svg_config["provider"],
         max_iterations=optimize_iterations,
         skip_base64_validation=True,
+        fix_svg_api_key=fix_svg_config["api_key"],
+        fix_svg_model=fix_svg_config["model"],
+        fix_svg_base_url=fix_svg_config["base_url"],
+        fix_svg_provider=fix_svg_config["provider"],
     )
 
     if stop_after == 4:
@@ -2676,21 +3624,19 @@ if __name__ == "__main__":
     # 输出参数
     parser.add_argument("--output_dir", default="./output", help="输出目录（默认: ./output）")
 
-    # Provider 参数
-    parser.add_argument(
-        "--provider",
-        choices=["openrouter", "bianxie", "gemini"],
-        default="bianxie",
-        help="API 提供商（默认: bianxie）"
-    )
-
-    # API 参数
-    parser.add_argument("--api_key", default=None, help="API Key")
-    parser.add_argument("--base_url", default=None, help="API base URL（默认根据 provider 自动设置）")
-
     # 模型参数
-    parser.add_argument("--image_model", default=None, help="生图模型（默认根据 provider 自动设置）")
-    parser.add_argument("--svg_model", default=None, help="SVG生成模型（默认根据 provider 自动设置）")
+    parser.add_argument("--image_model", default=None, help="生图模型")
+    parser.add_argument("--svg_model", default=None, help="SVG生成模型")
+    parser.add_argument("--image_provider", default="gemini", help="生图链路 provider")
+    parser.add_argument("--image_api_key", default=None, help="生图链路 API Key")
+    parser.add_argument("--image_base_url", default=None, help="生图链路 API base URL")
+    parser.add_argument("--svg_provider", default="gemini", help="SVG链路 provider")
+    parser.add_argument("--svg_api_key", default=None, help="SVG链路 API Key")
+    parser.add_argument("--svg_base_url", default=None, help="SVG链路 API base URL")
+    parser.add_argument("--fix_svg_model", default=None, help="SVG修复模型")
+    parser.add_argument("--fix_svg_provider", default="gemini", help="SVG修复链路 provider")
+    parser.add_argument("--fix_svg_api_key", default=None, help="SVG修复链路 API Key")
+    parser.add_argument("--fix_svg_base_url", default=None, help="SVG修复链路 API base URL")
 
     # Step 1 参考图片参数
     parser.add_argument(
@@ -2699,9 +3645,11 @@ if __name__ == "__main__":
         help="步骤一使用参考图片风格（需要同时提供 --reference_image_path）"
     )
     parser.add_argument("--reference_image_path", default=None, help="参考图片路径（可选）")
+    parser.add_argument("--input_image", default=None, help="直接提供输入图片路径，跳过步骤一的图片生成（使用上传图片代替AI生成）")
+    parser.add_argument("--resume_dir", default=None, help="从上一次运行的输出目录续跑：自动复制 figure.png/samed.png/boxlib.json/icons/ 到新目录以跳过已完成的步骤")
 
     # SAM3 参数
-    parser.add_argument("--sam_prompt", default="icon,robot,animal,person", help="SAM3 文本提示，支持逗号分隔多个prompt（如 'icon,diagram,arrow'，默认: icon）")
+    parser.add_argument("--sam_prompt", default="icon, illustration, person, robot, machine, device, animal", help="SAM3 文本提示，支持逗号分隔多个prompt")
     parser.add_argument("--min_score", type=float, default=0.0, help="SAM3 最低置信度阈值（默认: 0.0）")
     parser.add_argument(
         "--sam_backend",
@@ -2753,6 +3701,13 @@ if __name__ == "__main__":
         help="Box合并阈值，重叠比例超过此值则合并（0表示不合并，默认: 0.9）"
     )
 
+    # 增强检测参数
+    parser.add_argument(
+        "--enable_enhanced_detection",
+        action="store_true",
+        help="启用增强检测补充SAM3遗漏的视觉元素"
+    )
+
     args = parser.parse_args()
 
     if args.use_reference_image and not args.reference_image_path:
@@ -2775,11 +3730,8 @@ if __name__ == "__main__":
     result = method_to_svg(
         method_text=method_text,
         output_dir=args.output_dir,
-        api_key=args.api_key,
-        base_url=args.base_url,
-        provider=args.provider,
-        image_gen_model=args.image_model,
-        svg_gen_model=args.svg_model,
+        resume_dir=args.resume_dir,
+        input_image=args.input_image,
         sam_prompts=args.sam_prompt,
         min_score=args.min_score,
         sam_backend=args.sam_backend,
@@ -2790,4 +3742,17 @@ if __name__ == "__main__":
         placeholder_mode=args.placeholder_mode,
         optimize_iterations=args.optimize_iterations,
         merge_threshold=args.merge_threshold,
+        enable_enhanced_detection=args.enable_enhanced_detection,
+        image_api_key=args.image_api_key,
+        image_base_url=args.image_base_url,
+        image_provider=args.image_provider,
+        image_model=args.image_model,
+        svg_api_key=args.svg_api_key,
+        svg_base_url=args.svg_base_url,
+        svg_provider=args.svg_provider,
+        svg_model=args.svg_model,
+        fix_svg_api_key=args.fix_svg_api_key,
+        fix_svg_base_url=args.fix_svg_base_url,
+        fix_svg_provider=args.fix_svg_provider,
+        fix_svg_model=args.fix_svg_model,
     )

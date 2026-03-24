@@ -104,6 +104,11 @@ body::before {
   gap: 24px;
 }
 
+.card-left {
+  display: flex;
+  flex-direction: column;
+}
+
 .card {
   background: var(--panel);
   border: 1px solid var(--line);
@@ -471,6 +476,19 @@ select {
   color: var(--accent-strong);
   text-transform: uppercase;
   letter-spacing: 0.8px;
+}
+
+#imageGenSection {
+  transition: opacity 0.25s ease;
+}
+
+.upload-zone.has-file {
+  border-color: var(--accent);
+  background: rgba(22, 155, 155, 0.07);
+}
+
+.upload-zone.has-file .upload-text {
+  color: var(--accent-strong);
 }
 
 @media (max-width: 900px) {

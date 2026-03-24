@@ -17,70 +17,142 @@
       </header>
 
       <main class="input-layout">
-        <section class="card">
-          <label class="field-label" for="methodText">Method Text</label>
-          <textarea
-            id="methodText"
-            class="textarea"
-            placeholder="Paste your paper method text here..."
-          ></textarea>
-          <div class="hint">Tip: concise, structured method text yields cleaner templates.</div>
+        <!-- Left column -->
+        <section class="card-left">
+          <section class="card" style="margin-bottom: 24px;">
+            <label class="field-label" for="methodText">Method Text</label>
+            <textarea
+              id="methodText"
+              class="textarea"
+              placeholder="Paste your paper method text here..."
+            ></textarea>
+            <div class="hint">Tip: concise, structured method text yields cleaner templates.</div>
+          </section>
+
+          <section class="card">
+            <div class="panel-header" style="margin-bottom: 16px; padding-bottom: 8px; border-bottom: 1px solid var(--line);">Advanced Settings (高级设置)</div>
+
+            <div class="field-group">
+              <label class="field-label" for="optimizeIterations">Optimize Iterations</label>
+              <input id="optimizeIterations" class="input" type="number" min="0" value="0" />
+            </div>
+
+            <div class="field-group">
+              <label class="field-label" for="samBackend">SAM3 Backend</label>
+              <select id="samBackend" class="input">
+                <option value="local" selected>Local (SAM3)</option>
+                <option value="fal">fal.ai API</option>
+                <option value="roboflow">Roboflow API</option>
+              </select>
+            </div>
+
+            <div class="field-group" id="samApiKeyGroup" hidden>
+              <label class="field-label" for="samApiKey">SAM3 API Key</label>
+              <input id="samApiKey" type="password" class="input" placeholder="FAL/Roboflow API key" />
+            </div>
+
+            <div class="field-group">
+              <label class="field-label" for="samPrompt">SAM3 Prompt (自定义分割提示词)</label>
+              <textarea
+                id="samPrompt"
+                class="input"
+                rows="3"
+                style="resize: vertical; line-height: 1.5;"
+                placeholder="icon, illustration, person, robot, machine, device, animal"
+              ></textarea>
+              <div class="hint">逗号分隔多个提示词，留空则使用默认提示词</div>
+            </div>
+
+            <div class="field-group">
+              <label class="field-label" for="referenceFile">Reference Image (风格参考图)</label>
+              <div class="upload-zone" id="uploadZone">
+                <input id="referenceFile" class="file-input" type="file" accept="image/*" />
+                <div class="upload-text">Drop image here or click to upload</div>
+              </div>
+              <div class="upload-meta">
+                <img id="referencePreview" class="upload-preview" alt="Reference preview" />
+                <div id="referenceStatus" class="hint"></div>
+              </div>
+            </div>
+          </section>
         </section>
 
+        <!-- Right column -->
         <section class="card">
-          <div class="field-group">
-            <label class="field-label" for="provider">Provider</label>
-            <select id="provider" class="input">
-              <option value="bianxie">Bianxie</option>
-              <option value="openrouter">OpenRouter</option>
-              <option value="gemini" selected>Gemini (Google)</option>
-            </select>
-          </div>
+          <!-- Input Image Upload (skip generation) -->
+          <div class="panel-header" style="margin-bottom: 16px; padding-bottom: 8px; border-bottom: 1px solid var(--line);">0. Upload Image — Skip Generation (上传图片·跳过生图)</div>
 
           <div class="field-group">
-            <label class="field-label" for="apiKey">API Key</label>
-            <input id="apiKey" type="password" class="input" placeholder="sk-..." />
-          </div>
-
-          <div class="field-group">
-            <label class="field-label" for="optimizeIterations">Optimize</label>
-            <input id="optimizeIterations" class="input" type="number" min="0" value="0" />
-          </div>
-
-          <div class="field-group">
-            <label class="field-label" for="samBackend">SAM3 Backend</label>
-            <select id="samBackend" class="input">
-              <option value="local" selected>Local (SAM3)</option>
-              <option value="fal">fal.ai API</option>
-              <option value="roboflow">Roboflow API</option>
-            </select>
-          </div>
-
-          <div class="field-group" id="samApiKeyGroup" hidden>
-            <label class="field-label" for="samApiKey">SAM3 API Key</label>
-            <input
-              id="samApiKey"
-              type="password"
-              class="input"
-              placeholder="FAL/Roboflow API key"
-            />
-          </div>
-
-          <div class="field-group">
-            <label class="field-label" for="referenceFile">Reference Image</label>
-            <div class="upload-zone" id="uploadZone">
-              <input id="referenceFile" class="file-input" type="file" accept="image/*" />
-              <div class="upload-text">Drop image here or click to upload</div>
+            <div class="upload-zone" id="inputImageZone">
+              <input id="inputImageFile" class="file-input" type="file" accept="image/*" />
+              <div id="inputImageText" class="upload-text">上传图片后将跳过 AI 生图阶段，直接使用此图片<br/><span style="opacity:0.6;font-size:11px;">Drop image or click · PNG / JPG / WEBP</span></div>
             </div>
             <div class="upload-meta">
-              <img id="referencePreview" class="upload-preview" alt="Reference preview" />
-              <div id="referenceStatus" class="hint"></div>
+              <img id="inputImagePreview" class="upload-preview" alt="Input image preview" />
+              <div id="inputImageStatus" class="hint"></div>
             </div>
+            <div id="inputImageNote" class="hint" style="color: var(--accent-strong); display: none;">✓ 已上传输入图片，生图 API 设置将被忽略</div>
+          </div>
+
+          <!-- Divider -->
+          <div class="panel-header" style="margin-top: 24px; margin-bottom: 16px; padding-bottom: 8px; border-bottom: 1px solid var(--line);">1. Image Generation (生图 API)</div>
+          <div id="imageGenSection">
+            <div class="field-group">
+              <label class="field-label" for="imageProvider">Image Provider</label>
+              <select id="imageProvider" class="input">
+                <option value="gemini" selected>gemini</option>
+                <option value="openrouter">openrouter</option>
+                <option value="anthropic">anthropic</option>
+                <option value="custom">custom (OpenAI Compatible)</option>
+              </select>
+            </div>
+
+            <div class="field-group">
+              <label class="field-label" for="imageBaseUrl">Image Base URL</label>
+              <input id="imageBaseUrl" name="image-base-url" type="text" class="input" placeholder="https://..." autocomplete="off" />
+            </div>
+
+            <div class="field-group">
+              <label class="field-label" for="imageApiKey">Image API Key</label>
+              <input id="imageApiKey" name="image-api-key" type="password" class="input" placeholder="sk-..." autocomplete="new-password" />
+            </div>
+
+            <div class="field-group">
+              <label class="field-label" for="imageModel">Image Model</label>
+              <input id="imageModel" type="text" class="input" placeholder="gemini-3-pro-image-preview" />
+            </div>
+          </div>
+
+          <div class="panel-header" style="margin-top: 24px; margin-bottom: 16px; padding-bottom: 8px; border-bottom: 1px solid var(--line);">2. SVG & Multimodal (排版与理解)</div>
+
+          <div class="field-group">
+            <label class="field-label" for="svgProvider">SVG Provider</label>
+            <select id="svgProvider" class="input">
+              <option value="anthropic" selected>anthropic</option>
+              <option value="gemini">gemini</option>
+              <option value="openrouter">openrouter</option>
+              <option value="custom">custom (OpenAI Compatible)</option>
+            </select>
+          </div>
+
+          <div class="field-group">
+            <label class="field-label" for="svgBaseUrl">SVG Base URL</label>
+            <input id="svgBaseUrl" name="svg-base-url" type="text" class="input" placeholder="https://..." />
+          </div>
+
+          <div class="field-group">
+            <label class="field-label" for="svgApiKey">SVG API Key</label>
+            <input id="svgApiKey" name="svg-api-key" type="password" class="input" placeholder="sk-..." />
+          </div>
+
+          <div class="field-group">
+            <label class="field-label" for="svgModel">SVG Model</label>
+            <input id="svgModel" type="text" class="input" placeholder="claude-sonnet-4-6-thinking / gemini-2.5-pro" />
           </div>
         </section>
 
-        <section class="actions">
-          <button id="confirmBtn" class="primary">Confirm -> Canvas</button>
+        <section class="actions" style="grid-column: 1 / -1;">
+          <button id="confirmBtn" class="primary" style="width: 100%;">Confirm → Canvas</button>
           <div id="errorMsg" class="error"></div>
         </section>
       </main>

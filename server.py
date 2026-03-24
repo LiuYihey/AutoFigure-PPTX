@@ -3,8 +3,6 @@ from __future__ import annotations
 import json
 import os
 import queue
-import shutil
-import signal
 import socket
 import subprocess
 import threading
@@ -17,7 +15,8 @@ from pathlib import Path
 from typing import Optional
 
 from fastapi import FastAPI, HTTPException, UploadFile, File
-from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse, Response
+import mimetypes
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -29,9 +28,41 @@ OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
 UPLOADS_DIR = BASE_DIR / "uploads"
 UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
 
-PYTHON_EXECUTABLE = os.environ.get("AUTOFIGURE_PYTHON") or sys.executable
+def _find_best_python() -> str:
+    """Find the best Python executable: prefer figure conda env, fallback to sys.executable."""
+    explicit = os.environ.get("AUTOFIGURE_PYTHON")
+    if explicit and Path(explicit).is_file():
+        return explicit
 
-DEFAULT_SAM_PROMPT = "icon,person,animal,robot"
+    # Try to find figure conda env Python
+    conda_exe = os.environ.get("CONDA_EXE")
+    if conda_exe:
+        conda_root = Path(conda_exe).parent.parent
+        for env_name in ["figure"]:
+            candidates = [
+                conda_root / "envs" / env_name / "python.exe",
+                conda_root / "envs" / env_name / "bin" / "python",
+            ]
+            for candidate in candidates:
+                if candidate.is_file():
+                    return str(candidate)
+
+    # Also check CONDA_PREFIX siblings
+    conda_prefix = os.environ.get("CONDA_PREFIX")
+    if conda_prefix:
+        envs_dir = Path(conda_prefix).parent
+        for env_name in ["figure"]:
+            for suffix in ["python.exe", "bin/python"]:
+                candidate = envs_dir / env_name / suffix
+                if candidate.is_file():
+                    return str(candidate)
+
+    return sys.executable
+
+
+PYTHON_EXECUTABLE = _find_best_python()
+
+DEFAULT_SAM_PROMPT = "icon, illustration, person, robot, machine, device, animal"
 DEFAULT_PLACEHOLDER_MODE = "label"
 DEFAULT_MERGE_THRESHOLD = 0.01
 
@@ -71,11 +102,18 @@ class Job:
 
 class RunRequest(BaseModel):
     method_text: str = Field(..., min_length=1)
-    provider: str = "bianxie"
-    api_key: Optional[str] = None
-    base_url: Optional[str] = None
     image_model: Optional[str] = None
     svg_model: Optional[str] = None
+    fix_svg_model: Optional[str] = None
+    image_provider: str = "gemini"
+    image_api_key: str = ""
+    image_base_url: str = ""
+    svg_provider: str = "gemini"
+    svg_api_key: str = ""
+    svg_base_url: str = ""
+    fix_svg_provider: str = "gemini"
+    fix_svg_api_key: str = ""
+    fix_svg_base_url: str = ""
     sam_prompt: Optional[str] = None
     sam_backend: Optional[str] = None
     sam_api_key: Optional[str] = None
@@ -84,6 +122,8 @@ class RunRequest(BaseModel):
     merge_threshold: Optional[float] = None
     optimize_iterations: Optional[int] = None
     reference_image_path: Optional[str] = None
+    input_image_path: Optional[str] = None
+    resume_dir: Optional[str] = None
 
 
 app = FastAPI()
@@ -110,18 +150,36 @@ def run_job(req: RunRequest) -> JSONResponse:
         req.method_text,
         "--output_dir",
         str(output_dir),
-        "--provider",
-        req.provider,
     ]
 
-    if req.api_key:
-        cmd += ["--api_key", req.api_key]
-    if req.base_url:
-        cmd += ["--base_url", req.base_url]
     if req.image_model:
         cmd += ["--image_model", req.image_model]
     if req.svg_model:
         cmd += ["--svg_model", req.svg_model]
+    if req.image_provider:
+        cmd += ["--image_provider", req.image_provider]
+    if req.image_api_key:
+        cmd += ["--image_api_key", req.image_api_key]
+    if req.image_base_url:
+        cmd += ["--image_base_url", req.image_base_url]
+    if req.svg_provider:
+        cmd += ["--svg_provider", req.svg_provider]
+    if req.svg_api_key:
+        cmd += ["--svg_api_key", req.svg_api_key]
+    if req.svg_base_url:
+        cmd += ["--svg_base_url", req.svg_base_url]
+    fix_svg_provider = req.fix_svg_provider or req.svg_provider or ""
+    fix_svg_api_key = req.fix_svg_api_key or req.svg_api_key or ""
+    fix_svg_base_url = req.fix_svg_base_url or req.svg_base_url or ""
+    fix_svg_model = req.fix_svg_model or req.svg_model or ""
+    if fix_svg_provider:
+        cmd += ["--fix_svg_provider", fix_svg_provider]
+    if fix_svg_api_key:
+        cmd += ["--fix_svg_api_key", fix_svg_api_key]
+    if fix_svg_base_url:
+        cmd += ["--fix_svg_base_url", fix_svg_base_url]
+    if fix_svg_model:
+        cmd += ["--fix_svg_model", fix_svg_model]
 
     sam_prompt = req.sam_prompt or DEFAULT_SAM_PROMPT
     placeholder_mode = req.placeholder_mode or DEFAULT_PLACEHOLDER_MODE
@@ -149,6 +207,21 @@ def run_job(req: RunRequest) -> JSONResponse:
             else reference_path
         )
         cmd += ["--reference_image_path", reference_path]
+
+    input_image_path = req.input_image_path
+    if input_image_path:
+        input_image_path = (
+            str((BASE_DIR / input_image_path).resolve())
+            if not Path(input_image_path).is_absolute()
+            else input_image_path
+        )
+        cmd += ["--input_image", input_image_path]
+
+    if req.resume_dir:
+        resume_path = req.resume_dir
+        if not Path(resume_path).is_absolute():
+            resume_path = str((OUTPUTS_DIR / resume_path).resolve())
+        cmd += ["--resume_dir", resume_path]
 
     env = os.environ.copy()
     env["PYTHONUNBUFFERED"] = "1"
@@ -231,7 +304,7 @@ def stream_events(job_id: str) -> StreamingResponse:
 
 
 @app.get("/api/artifacts/{job_id}/{path:path}")
-def get_artifact(job_id: str, path: str) -> FileResponse:
+def get_artifact(job_id: str, path: str) -> Response:
     job = JOBS.get(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
@@ -241,7 +314,199 @@ def get_artifact(job_id: str, path: str) -> FileResponse:
         raise HTTPException(status_code=400, detail="Invalid path")
     if not candidate.is_file():
         raise HTTPException(status_code=404, detail="File not found")
+
+    # 为了避免运行中被持续追加的文件 (如 run.log) 
+    # 被 FastAPI/Starlette 的 FileResponse 预计算出较小的 Content-Length
+    # 导致读取时传输的数据大于 Content-Length 而触发 h11._util.LocalProtocolError
+    # 这里直接将较小文件（<15MB）读入内存作为普通 Response 返回
+    size_limit = 15 * 1024 * 1024
+    if candidate.stat().st_size < size_limit:
+        mime_type, _ = mimetypes.guess_type(candidate)
+        return Response(content=candidate.read_bytes(), media_type=mime_type)
+    
     return FileResponse(candidate)
+
+
+class SaveSvgRequest(BaseModel):
+    svg: str
+
+
+@app.post("/api/save-svg/{job_id}")
+async def save_svg(job_id: str, req: SaveSvgRequest) -> JSONResponse:
+    job = JOBS.get(job_id)
+    if job:
+        output_dir = job.output_dir
+    else:
+        # Job may no longer be in memory (server restart / completed) — resolve from disk
+        output_dir = OUTPUTS_DIR / job_id
+        if not output_dir.is_dir():
+            raise HTTPException(status_code=404, detail="Job not found")
+    svg_path = output_dir / "final.svg"
+    svg_path.write_text(req.svg, encoding="utf-8")
+    return JSONResponse({"ok": True, "path": str(svg_path)})
+
+
+class ExportPptxRequest(BaseModel):
+    svg: str
+    width_cm: float = 33.87
+    height_cm: float = 19.05
+
+
+@app.post("/api/export-pptx/{job_id}")
+async def export_pptx(job_id: str, req: ExportPptxRequest) -> Response:
+    """Export SVG as a PPTX with the SVG embedded as a native Office SVG image.
+
+    Office 2016+ (and LibreOffice 6+) natively renders SVG images placed via the
+    OOXML SVG extension (<asvg:svgBlip>).  The shape stays fully vector and every
+    text / path element is editable inside PowerPoint without any rasterisation.
+
+    How it works:
+      1. Build a minimal PPTX in-memory with python-pptx.
+      2. Add a 1×1 px placeholder PNG (required by OOXML – the blipFill must have a
+         fallback raster Part even when an SVG extension is present).
+      3. Inject the SVG bytes as a new Part into the zip and attach it to the shape
+         via the <asvg:svgBlip r:embed="…"/> extension element.
+    The resulting file opens in PPT as a fully editable SVG image.
+    """
+    job = JOBS.get(job_id)
+    if not job:
+        # Allow export even when job is no longer in memory (server restart / completed)
+        output_dir = OUTPUTS_DIR / job_id
+        if not output_dir.is_dir():
+            raise HTTPException(status_code=404, detail="Job not found")
+
+    try:
+        import io as _io
+        import zipfile as _zipfile
+        from xml.etree import ElementTree as ET
+
+        from pptx import Presentation
+        from pptx.util import Cm
+        from lxml import etree as _etree
+
+        NS_A    = "http://schemas.openxmlformats.org/drawingml/2006/main"
+        NS_ASVG = "http://schemas.microsoft.com/office/drawing/2016/SVG/main"
+        NS_R    = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+        NS_REL  = "http://schemas.openxmlformats.org/package/2006/relationships"
+        NS_CT   = "http://schemas.openxmlformats.org/package/2006/content-types"
+        SVG_IMG_TYPE = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/image"
+
+        # ── 1. Parse SVG dimensions ──────────────────────────────────────────
+        svg_bytes = req.svg.encode("utf-8")
+        try:
+            root = ET.fromstring(svg_bytes)
+            raw_w = root.get("width", "") or ""
+            raw_h = root.get("height", "") or ""
+            svg_w = float(raw_w.replace("px", "").strip()) if raw_w.replace("px", "").strip() else None
+            svg_h = float(raw_h.replace("px", "").strip()) if raw_h.replace("px", "").strip() else None
+            if svg_w is None or svg_h is None:
+                vb = root.get("viewBox", "")
+                parts = vb.split()
+                if len(parts) == 4:
+                    svg_w = float(parts[2])
+                    svg_h = float(parts[3])
+                else:
+                    svg_w, svg_h = 1200.0, 800.0
+        except Exception:
+            svg_w, svg_h = 1200.0, 800.0
+
+        # ── 2. Build PPTX with 1×1 transparent PNG as raster fallback ────────
+        prs = Presentation()
+        prs.slide_width = Cm(req.width_cm)
+        prs.slide_height = Cm(req.height_cm)
+        slide = prs.slides.add_slide(prs.slide_layouts[6])
+        slide_w_emu = int(prs.slide_width)
+        slide_h_emu = int(prs.slide_height)
+
+        TRANSPARENT_1PX_PNG = (
+            b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00"
+            b"\x01\x08\x06\x00\x00\x00\x1f\x15\xc4\x89\x00\x00\x00\nIDATx\x9cc"
+            b"\x00\x01\x00\x00\x05\x00\x01\r\n-\xb4\x00\x00\x00\x00IEND\xaeB`\x82"
+        )
+        slide.shapes.add_picture(_io.BytesIO(TRANSPARENT_1PX_PNG), 0, 0, slide_w_emu, slide_h_emu)
+
+        buf = _io.BytesIO()
+        prs.save(buf)
+        buf.seek(0)
+
+        # ── 3. Zip-level injection of SVG part + relationship + svgBlip ───────
+        SLIDE_XML  = "ppt/slides/slide1.xml"
+        SLIDE_RELS = "ppt/slides/_rels/slide1.xml.rels"
+        SVG_PART   = "ppt/media/image_svg1.svg"
+        SVG_RID    = "rIdSVG1"
+        rid = SVG_RID  # pre-initialize before zip loop
+
+        out_buf = _io.BytesIO()
+        with _zipfile.ZipFile(buf, "r") as zin, \
+             _zipfile.ZipFile(out_buf, "w", _zipfile.ZIP_DEFLATED) as zout:
+
+            for item in zin.infolist():
+                data = zin.read(item.filename)
+
+                # ── patch slide rels: add SVG relationship ──────────────────
+                if item.filename == SLIDE_RELS:
+                    rels_tree = _etree.fromstring(data)
+                    # avoid duplicate
+                    existing_ids = {el.get("Id") for el in rels_tree}
+                    rid = SVG_RID
+                    n = 1
+                    while rid in existing_ids:
+                        n += 1
+                        rid = f"rIdSVG{n}"
+                    rel_el = _etree.SubElement(rels_tree, f"{{{NS_REL}}}Relationship")
+                    rel_el.set("Id", rid)
+                    rel_el.set("Type", SVG_IMG_TYPE)
+                    rel_el.set("Target", "../media/image_svg1.svg")
+                    data = _etree.tostring(rels_tree, xml_declaration=True,
+                                           encoding="UTF-8", standalone=True)
+
+                # ── patch slide XML: inject <asvg:svgBlip> into <a:blip> ────
+                elif item.filename == SLIDE_XML:
+                    slide_tree = _etree.fromstring(data)
+                    # The blip is always <a:blip> regardless of parent namespace
+                    for blip_el in slide_tree.iter(f"{{{NS_A}}}blip"):
+                        ext_lst = blip_el.find(f"{{{NS_A}}}extLst")
+                        if ext_lst is None:
+                            ext_lst = _etree.SubElement(blip_el, f"{{{NS_A}}}extLst")
+                        ext = _etree.SubElement(ext_lst, f"{{{NS_A}}}ext")
+                        ext.set("uri", "{96DAC541-7B7A-43D3-8B79-37D633B846F1}")
+                        svg_blip = _etree.SubElement(ext, f"{{{NS_ASVG}}}svgBlip")
+                        svg_blip.set(f"{{{NS_R}}}embed", rid)
+                        break  # only first picture
+                    data = _etree.tostring(slide_tree, xml_declaration=True,
+                                           encoding="UTF-8", standalone=True)
+
+                # ── patch content types: register .svg if missing ───────────
+                elif item.filename == "[Content_Types].xml":
+                    ct_tree = _etree.fromstring(data)
+                    if not any(el.get("Extension") == "svg"
+                               for el in ct_tree.findall(f"{{{NS_CT}}}Default")):
+                        d = _etree.SubElement(ct_tree, f"{{{NS_CT}}}Default")
+                        d.set("Extension", "svg")
+                        d.set("ContentType", "image/svg+xml")
+                    data = _etree.tostring(ct_tree, xml_declaration=True,
+                                           encoding="UTF-8", standalone=True)
+
+                zout.writestr(item, data)
+
+            # write the SVG part itself
+            zout.writestr(SVG_PART, svg_bytes)
+
+        out_buf.seek(0)
+        filename = f"figure_{job_id}.pptx"
+        return Response(
+            content=out_buf.read(),
+            media_type="application/vnd.openxmlformats-officedocument.presentationml.presentation",
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        )
+    except ImportError as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"python-pptx not installed. Run: pip install python-pptx lxml. ({exc})",
+        )
+    except Exception as exc:
+        import traceback as _tb
+        raise HTTPException(status_code=500, detail=f"PPTX export error: {exc}\n{_tb.format_exc()}")
 
 
 @app.get("/api/uploads/{filename}")
@@ -359,131 +624,6 @@ def _classify_artifact(rel_path: str) -> str:
     return "artifact"
 
 
-def _port_in_use(port: int) -> bool:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        try:
-            sock.bind(("0.0.0.0", port))
-        except OSError:
-            return True
-    return False
-
-
-def _pids_on_port(port: int) -> set[int]:
-    pids: set[int] = set()
-
-    if shutil.which("lsof"):
-        result = subprocess.run(
-            ["lsof", "-t", f"-i:{port}"],
-            capture_output=True,
-            text=True,
-        )
-        for line in result.stdout.splitlines():
-            line = line.strip()
-            if line.isdigit():
-                pids.add(int(line))
-        return pids
-
-    if shutil.which("ss"):
-        result = subprocess.run(
-            ["ss", "-lptn", f"sport = :{port}"],
-            capture_output=True,
-            text=True,
-        )
-        for line in result.stdout.splitlines():
-            if "pid=" in line:
-                for part in line.split("pid=")[1:]:
-                    pid_str = "".join(ch for ch in part if ch.isdigit())
-                    if pid_str:
-                        pids.add(int(pid_str))
-        return pids
-
-    if shutil.which("netstat"):
-        result = subprocess.run(
-            ["netstat", "-tlnp"],
-            capture_output=True,
-            text=True,
-        )
-        for line in result.stdout.splitlines():
-            if f":{port} " not in line or "LISTEN" not in line:
-                continue
-            fields = line.split()
-            if fields and "/" in fields[-1]:
-                pid_part = fields[-1].split("/")[0]
-                if pid_part.isdigit():
-                    pids.add(int(pid_part))
-
-    return pids
-
-
-def _read_cmdline(pid: int) -> str:
-    try:
-        with open(f"/proc/{pid}/cmdline", "rb") as handle:
-            data = handle.read()
-        parts = [p for p in data.split(b"\x00") if p]
-        return " ".join(part.decode(errors="ignore") for part in parts)
-    except OSError:
-        return ""
-
-
-def _is_uvicorn_process(pid: int) -> bool:
-    cmdline = _read_cmdline(pid)
-    if not cmdline:
-        return False
-    if "uvicorn" not in cmdline:
-        return False
-    return "server:app" in cmdline or "server.py" in cmdline
-
-
-def _terminate_pids(pids: set[int], timeout: float = 2.0) -> None:
-    current_pid = os.getpid()
-    for pid in sorted(pids):
-        if pid <= 1 or pid == current_pid:
-            continue
-        if not _is_uvicorn_process(pid):
-            continue
-        try:
-            os.kill(pid, signal.SIGTERM)
-        except ProcessLookupError:
-            continue
-
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        alive = False
-        for pid in pids:
-            if pid <= 1 or pid == current_pid:
-                continue
-            if not _is_uvicorn_process(pid):
-                continue
-            try:
-                os.kill(pid, 0)
-                alive = True
-            except ProcessLookupError:
-                continue
-        if not alive:
-            return
-        time.sleep(0.1)
-
-    for pid in sorted(pids):
-        if pid <= 1 or pid == current_pid:
-            continue
-        if not _is_uvicorn_process(pid):
-            continue
-        try:
-            os.kill(pid, signal.SIGKILL)
-        except ProcessLookupError:
-            continue
-
-
-def _ensure_port_free(port: int) -> None:
-    if not _port_in_use(port):
-        return
-    pids = _pids_on_port(port)
-    if not pids:
-        return
-    _terminate_pids(pids)
-
-
 app.mount("/", StaticFiles(directory=WEB_DIR, html=True), name="static")
 
 
@@ -492,7 +632,21 @@ if __name__ == "__main__":
 
     def find_available_port(start_port: int, max_attempts: int = 100) -> int:
         for port in range(start_port, start_port + max_attempts):
+            # Quick check: if we can connect to 127.0.0.1:port, treat it as in-use.
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+                probe.settimeout(0.5)
+                try:
+                    if probe.connect_ex(("127.0.0.1", port)) == 0:
+                        print(f"Port {port} already serving on 127.0.0.1, trying next...")
+                        continue
+                except OSError:
+                    pass
+
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+                # On Windows, SO_EXCLUSIVEADDRUSE prevents successful bind when another process
+                # already owns the port (important when another app listens on 127.0.0.1).
+                if os.name == "nt" and hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+                    sock.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
                 try:
                     sock.bind(("0.0.0.0", port))
                     return port
@@ -501,22 +655,37 @@ if __name__ == "__main__":
                     continue
         raise IOError(f"No available ports found in range ({start_port} - {start_port + max_attempts})")
 
-    initial_port = 8000
-    
-    try:
-        actual_port = find_available_port(initial_port)
-        
-        print(f"--- Starting Server ---")
-        print(f"Local access: http://127.0.0.1:{actual_port}")
-        print(f"-----------------------")
+    def start_server_with_fallback() -> int:
+        # Allow overriding the initial port from environment for flexibility in Docker/PM2/etc.
+        initial_port = int(os.environ.get("AUTOFIGURE_PORT", 8000))
 
-        uvicorn.run(
-            "server:app",
-            host="0.0.0.0",
-            port=actual_port,
-            reload=False,
-            access_log=False,
-        )
+        try:
+            actual_port = find_available_port(initial_port)
+        except Exception as e:
+            print(f"Startup failed while searching port: {e}")
+            raise
+
+        for attempt in range(3):
+            try:
+                print("--- Starting Server ---")
+                print(f"Local access: http://127.0.0.1:{actual_port}")
+                print("-----------------------")
+
+                uvicorn.run(
+                    "server:app",
+                    host="0.0.0.0",
+                    port=actual_port,
+                    reload=False,
+                    access_log=False,
+                )
+                return actual_port
+            except OSError as exc:  # Catch bind errors even if a race occurs after our probe
+                print(f"Failed to bind port {actual_port} ({exc}), retrying with next port...")
+                actual_port += 1
+        raise SystemExit("Failed to start server after multiple port attempts")
+
+    try:
+        start_server_with_fallback()
     except Exception as e:
         print(f"Startup failed: {e}")
         sys.exit(1)
