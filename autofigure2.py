@@ -410,10 +410,11 @@ def _call_openai_compatible_image_generation(
         if not normalized_base_url.endswith('/v1'):
             normalized_base_url = f"{normalized_base_url}/v1"
             
+        import httpx
         client = OpenAI(
             api_key=api_key,
             base_url=normalized_base_url,
-            timeout=600.0,    # 600 seconds total timeout
+            timeout=httpx.Timeout(connect=30.0, read=None, write=60.0, pool=10.0),  # read=None: no read timeout for slow image generation
             max_retries=0,     # disable auto retries to avoid repeated charges
         )
 
@@ -1187,7 +1188,12 @@ def merge_two_boxes(box1: dict, box2: dict) -> dict:
     return merged
 
 
-def merge_overlapping_boxes(boxes: list, overlap_threshold: float = 0.9) -> list:
+def merge_overlapping_boxes(
+    boxes: list,
+    overlap_threshold: float = 0.3,
+    image_size: Optional[tuple[int, int]] = None,
+    max_merged_area_ratio: float = 0.1,
+) -> list:
     """
     迭代合并重叠的boxes
 
@@ -1203,6 +1209,11 @@ def merge_overlapping_boxes(boxes: list, overlap_threshold: float = 0.9) -> list
 
     # 复制列表避免修改原数据
     working_boxes = [box.copy() for box in boxes]
+    img_area = None
+    if image_size and len(image_size) >= 2:
+        img_w, img_h = image_size
+        if img_w > 0 and img_h > 0:
+            img_area = img_w * img_h
 
     merged = True
     iteration = 0
@@ -1217,9 +1228,15 @@ def merge_overlapping_boxes(boxes: list, overlap_threshold: float = 0.9) -> list
             for j in range(i + 1, n):
                 ratio = calculate_overlap_ratio(working_boxes[i], working_boxes[j])
                 if ratio >= overlap_threshold:
-                    # 合并 box_i 和 box_j
                     new_box = merge_two_boxes(working_boxes[i], working_boxes[j])
-                    # 移除原有两个box，添加合并后的box
+                    if img_area and max_merged_area_ratio > 0:
+                        merged_area = (new_box["x2"] - new_box["x1"]) * (new_box["y2"] - new_box["y1"])
+                        if merged_area > img_area * max_merged_area_ratio:
+                            print(
+                                f"    迭代 {iteration}: 取消合并 box {i} 和 box {j} "
+                                f"(合并后面积占比: {merged_area / img_area:.1%} 超过 {max_merged_area_ratio:.1%})"
+                            )
+                            continue
                     working_boxes = [
                         working_boxes[k] for k in range(n) if k != i and k != j
                     ]
@@ -1483,8 +1500,9 @@ def segment_with_sam3(
     image_path: str,
     output_dir: str,
     text_prompts: str = "icon",
-    min_score: float = 0.5,
-    merge_threshold: float = 0.9,
+    min_score: float = 0.2,
+    merge_threshold: float = 0.3,
+    max_box_area_ratio: float = 0.1,
     sam_backend: Literal["local", "fal", "roboflow", "api"] = "local",
     sam_api_key: Optional[str] = None,
     sam_max_masks: int = 32,
@@ -1552,7 +1570,7 @@ def segment_with_sam3(
         else:
             model = build_sam3_image_model(device=device, bpe_path=str(bpe_path) if bpe_path else None)
             
-        processor = Sam3Processor(model, device=device)
+        processor = Sam3Processor(model, device=device, confidence_threshold=min_score)
         inference_state = processor.set_image(image.convert("RGB") if image.mode != "RGB" else image)
 
         for prompt in prompt_list:
@@ -1568,9 +1586,14 @@ def segment_with_sam3(
                 scores = scores.cpu().numpy()
 
             prompt_count = 0
+            img_area = original_size[0] * original_size[1]
             for box, score in zip(boxes, scores):
                 if score >= min_score:
                     x1, y1, x2, y2 = int(box[0]), int(box[1]), int(box[2]), int(box[3])
+                    box_area = (x2 - x1) * (y2 - y1)
+                    if img_area > 0 and (box_area / img_area) > 0.7:
+                        print(f"    跳过: 框过大 ({box_area/img_area:.1%} 超过70%图像面积)")
+                        continue
                     all_detected_boxes.append({
                         "x1": x1, "y1": y1, "x2": x2, "y2": y2,
                         "score": float(score),
@@ -1686,9 +1709,15 @@ def segment_with_sam3(
 
     # === 新增：合并重叠的boxes ===
     if merge_threshold > 0 and len(valid_boxes) > 1:
-        print(f"\n  合并重叠的boxes (阈值: {merge_threshold})...")
+        max_area_text = f"{max_box_area_ratio:.1%}" if max_box_area_ratio > 0 else "不限制"
+        print(f"\n  合并重叠的boxes (阈值: {merge_threshold}, 最大面积: {max_area_text})...")
         original_count = len(valid_boxes)
-        valid_boxes = merge_overlapping_boxes(valid_boxes, merge_threshold)
+        valid_boxes = merge_overlapping_boxes(
+            valid_boxes,
+            merge_threshold,
+            image_size=original_size,
+            max_merged_area_ratio=max_box_area_ratio,
+        )
         merged_count = original_count - len(valid_boxes)
         if merged_count > 0:
             print(f"  合并完成: {original_count} -> {len(valid_boxes)} (合并了 {merged_count} 个)")
@@ -1715,6 +1744,30 @@ def segment_with_sam3(
             print(f"  警告: enhanced_detection模块未找到，跳过增强检测")
         except Exception as e:
             print(f"  警告: 增强检测失败: {e}")
+
+    final_max_box_area_ratio = max_box_area_ratio
+    img_area = original_size[0] * original_size[1]
+    if img_area > 0 and valid_boxes and final_max_box_area_ratio > 0:
+        filtered_boxes = []
+        removed_large_boxes = []
+        for box in valid_boxes:
+            box_area = (box["x2"] - box["x1"]) * (box["y2"] - box["y1"])
+            if (box_area / img_area) > final_max_box_area_ratio:
+                removed_large_boxes.append((box, box_area / img_area))
+            else:
+                filtered_boxes.append(box)
+
+        if removed_large_boxes:
+            print(f"\n  最终box面积过滤 (上限: {final_max_box_area_ratio:.1%})...")
+            for box, area_ratio in removed_large_boxes:
+                print(
+                    f"    跳过最终大框: {box['label']} ({box['x1']}, {box['y1']}, {box['x2']}, {box['y2']}), "
+                    f"score={box.get('score', 0):.3f}, prompt={box.get('prompt', '')}, 面积占比={area_ratio:.1%}"
+                )
+            valid_boxes = filtered_boxes
+            for i, box in enumerate(valid_boxes):
+                box["id"] = i
+                box["label"] = f"<AF>{i + 1:02d}"
 
     # 使用合并后的 valid_boxes 创建标记图片
     print(f"\n  绘制 samed.png (使用 {len(valid_boxes)} 个boxes)...")
@@ -1944,6 +1997,13 @@ CORE REQUIREMENT — PURE SVG (VERY IMPORTANT):
 - This includes: section boxes/frames, all text labels, titles, arrows, connectors, background panels, annotation text, legends.
 - Do NOT embed any PNG or raster image as a background layer (no <image href="data:...">, no base64 blobs).
 - The output SVG must be fully editable — every element independently selectable and movable.
+
+TEXT FIDELITY (CRITICAL — DO NOT VIOLATE):
+- ONLY include text that is CLEARLY VISIBLE and LEGIBLE in the original image.
+- Copy every text string CHARACTER FOR CHARACTER exactly as it appears. Do NOT paraphrase, translate, summarize, or reword any text.
+- Do NOT invent, infer, or add any text that is not explicitly visible in the image — no titles, labels, captions, or annotations that you are guessing.
+- If a text string is partially obscured or illegible, omit it entirely rather than guessing its content.
+- This rule applies to ALL text elements: titles, axis labels, legends, annotations, button labels, captions, etc.
 
 HANDLING ICONS (VERY IMPORTANT):
 - The figure contains illustration icons (complex cartoon/vector icons).
@@ -2740,46 +2800,18 @@ def replace_icons_in_svg(
             if g_match:
                 g_content = g_match.group(0)
 
-                # 解析 <g> 的 transform translate 属性
-                translate_x, translate_y = 0.0, 0.0
-                g_tag_match = re.match(r'<g[^>]*>', g_content, re.IGNORECASE)
-                if g_tag_match:
-                    g_tag = g_tag_match.group(0)
-                    transform_match = re.search(
-                        r'transform=["\'][^"\']*translate\s*\(\s*([\d.-]+)[\s,]+([\d.-]+)\s*\)',
-                        g_tag, re.IGNORECASE)
-                    if transform_match:
-                        translate_x = float(transform_match.group(1))
-                        translate_y = float(transform_match.group(2))
-                        print(f"  {label}: 检测到 <g> transform: translate({translate_x}, {translate_y})")
-
-                # 从 <g> 中提取 <rect> 的尺寸
-                rect_patterns = [
-                    r'<rect[^>]*\bx=["\']?([\d.]+)["\']?[^>]*\by=["\']?([\d.]+)["\']?[^>]*\bwidth=["\']?([\d.]+)["\']?[^>]*\bheight=["\']?([\d.]+)["\']?',
-                    r'<rect[^>]*\bwidth=["\']?([\d.]+)["\']?[^>]*\bheight=["\']?([\d.]+)["\']?[^>]*\bx=["\']?([\d.]+)["\']?[^>]*\by=["\']?([\d.]+)["\']?',
-                ]
-                rect_info = None
-                for rp in rect_patterns:
-                    rect_match = re.search(rp, g_content, re.IGNORECASE)
-                    if rect_match:
-                        groups = rect_match.groups()
-                        if 'width' in rp[:50]:
-                            width, height, x, y = groups
-                        else:
-                            x, y, width, height = groups
-                        rect_info = {'x': float(x) + translate_x, 'y': float(y) + translate_y,
-                                     'width': float(width), 'height': float(height)}
-                        break
-
-                if rect_info:
-                    x, y, w, h = rect_info['x'], rect_info['y'], rect_info['width'], rect_info['height']
-                    image_tag = (f'<image id="icon_{label_clean}" x="{x}" y="{y}" '
-                                 f'width="{w}" height="{h}" '
-                                 f'href="data:image/png;base64,{icon_b64}" '
-                                 f'preserveAspectRatio="xMidYMid meet"/>')
-                    svg_content = svg_content.replace(g_content, image_tag)
-                    print(f"  {label}: 替换成功 (序号匹配 <g>) at ({x}, {y}) size {w}x{h}")
-                    replaced = True
+                # 直接使用 boxlib 中的权威坐标（乘以 scale），不信任 LLM 生成的 SVG 坐标
+                x = icon_info["x1"] * scale_x
+                y = icon_info["y1"] * scale_y
+                w = (icon_info["x2"] - icon_info["x1"]) * scale_x
+                h = (icon_info["y2"] - icon_info["y1"]) * scale_y
+                image_tag = (f'<image id="icon_{label_clean}" x="{x:.1f}" y="{y:.1f}" '
+                             f'width="{w:.1f}" height="{h:.1f}" '
+                             f'href="data:image/png;base64,{icon_b64}" '
+                             f'preserveAspectRatio="xMidYMid meet"/>')
+                svg_content = svg_content.replace(g_content, image_tag)
+                print(f"  {label}: 替换成功 (序号匹配 <g>) at ({x:.1f}, {y:.1f}) size {w:.1f}x{h:.1f}")
+                replaced = True
 
             # 方式2：查找包含 label 文本的 <text> 附近的 <rect>
             if not replaced:
@@ -3119,7 +3151,7 @@ I'm providing you with 4 inputs:
 3. **Image 3 (current SVG rendered as PNG)**: The current state of our SVG
 4. **Current SVG code**: The SVG code that needs optimization
 
-Please carefully compare and check the following **TWO MAJOR ASPECTS with EIGHT KEY POINTS**:
+Please carefully compare and check the following **THREE MAJOR ASPECTS**:
 
 ## ASPECT 1: POSITION (位置)
 1. **Icons (图标)**: Are icon placeholder positions matching the original?
@@ -3133,6 +3165,13 @@ Please carefully compare and check the following **TWO MAJOR ASPECTS with EIGHT 
 7. **Arrows (箭头)**: Arrow styles, thicknesses, colors
 8. **Lines/Borders (线条)**: Line styles, colors, stroke widths
 
+## ASPECT 3: TEXT FIDELITY AUDIT (文字忠实度审核) — CRITICAL
+Compare EVERY `<text>` element in the current SVG against what is clearly visible in Image 1 (the original figure):
+9. **Remove hallucinated text**: Delete any `<text>` whose content does NOT appear in the original image (invented titles, labels, captions, annotations).
+10. **Correct wrong text**: Fix any `<text>` whose content is paraphrased, translated, summarized, or otherwise different from the original — copy the exact characters visible in the image.
+11. **Omit illegible text**: If the original text is partially obscured or too small to read clearly, remove that `<text>` element rather than guessing.
+12. **Do NOT add new text**: Do not introduce any `<text>` element whose string is not unambiguously visible in Image 1.
+
 **CURRENT SVG CODE:**
 ```xml
 {current_svg}
@@ -3143,7 +3182,8 @@ Please carefully compare and check the following **TWO MAJOR ASPECTS with EIGHT 
 - Start with <svg and end with </svg>
 - Do NOT include markdown formatting or explanations
 - Keep all icon placeholder structures intact (the <g> elements with id like "AF01")
-- Focus on position and style corrections"""
+- Focus on position, style corrections, AND text fidelity — all three aspects must be addressed in this single pass
+- TEXT RULE: every `<text>` in the output must correspond to text clearly visible in the original image, copied character-for-character"""
 
         contents = [prompt, figure_img, samed_img, current_png_img]
 
@@ -3155,7 +3195,7 @@ Please carefully compare and check the following **TWO MAJOR ASPECTS with EIGHT 
                 model=model,
                 base_url=base_url,
                 provider=provider,
-                max_tokens=4096,
+                max_tokens=50000,
                 temperature=0.3,
             )
 
@@ -3217,7 +3257,6 @@ Please carefully compare and check the following **TWO MAJOR ASPECTS with EIGHT 
     return str(output_path)
 
 
-# ============================================================================
 # 主函数：完整流程
 # ============================================================================
 
@@ -3226,8 +3265,8 @@ def method_to_svg(
     output_dir: str = "./output",
     resume_dir: Optional[str] = None,
     input_image: Optional[str] = None,
-    sam_prompts: str = "icon, flowchart, illustration, person, robot, machine, device, animal, diagram",
-    min_score: float = 0.5,
+    sam_prompts: str = "icon, illustration, person, robot, machine, device, animal, Signal, MRI",
+    min_score: float = 0.2,
     sam_backend: Literal["local", "fal", "roboflow", "api"] = "local",
     sam_api_key: Optional[str] = None,
     sam_max_masks: int = 32,
@@ -3235,7 +3274,8 @@ def method_to_svg(
     stop_after: int = 5,
     placeholder_mode: PlaceholderMode = "label",
     optimize_iterations: int = 2,
-    merge_threshold: float = 0.9,
+    merge_threshold: float = 0.3,
+    max_box_area_ratio: float = 0.1,
     enable_enhanced_detection: bool = True,
     image_api_key: Optional[str] = None,
     image_base_url: Optional[str] = None,
@@ -3353,6 +3393,7 @@ def method_to_svg(
     print(f"占位符模式: {placeholder_mode}")
     print(f"优化迭代次数: {optimize_iterations}")
     print(f"Box合并阈值: {merge_threshold}")
+    print(f"最大框面积上限: {'不限制' if max_box_area_ratio <= 0 else f'{max_box_area_ratio:.1%}'}")
     print("=" * 60)
 
     # 步骤一：生成图片（如果提供了 input_image 则直接复制；若 figure.png 已存在则跳过）
@@ -3411,6 +3452,7 @@ def method_to_svg(
             text_prompts=sam_prompts,
             min_score=min_score,
             merge_threshold=merge_threshold,
+            max_box_area_ratio=max_box_area_ratio,
             sam_backend=sam_backend_value,
             sam_api_key=sam_api_key,
             sam_max_masks=sam_max_masks,
@@ -3649,8 +3691,8 @@ if __name__ == "__main__":
     parser.add_argument("--resume_dir", default=None, help="从上一次运行的输出目录续跑：自动复制 figure.png/samed.png/boxlib.json/icons/ 到新目录以跳过已完成的步骤")
 
     # SAM3 参数
-    parser.add_argument("--sam_prompt", default="icon, illustration, person, robot, machine, device, animal", help="SAM3 文本提示，支持逗号分隔多个prompt")
-    parser.add_argument("--min_score", type=float, default=0.0, help="SAM3 最低置信度阈值（默认: 0.0）")
+    parser.add_argument("--sam_prompt", default="icon, illustration, person, robot, machine, device, animal, Signal, MRI", help="SAM3 文本提示，支持逗号分隔多个prompt")
+    parser.add_argument("--min_score", type=float, default=0.2, help="SAM3 最低置信度阈值（默认: 0.2）")
     parser.add_argument(
         "--sam_backend",
         choices=["local", "fal", "roboflow", "api"],
@@ -3697,8 +3739,14 @@ if __name__ == "__main__":
     parser.add_argument(
         "--merge_threshold",
         type=float,
-        default=0.001,
-        help="Box合并阈值，重叠比例超过此值则合并（0表示不合并，默认: 0.9）"
+        default=0.3,
+        help="Box合并阈值，重叠比例超过此值则合并（0表示不合并，默认: 0.3）"
+    )
+    parser.add_argument(
+        "--max_box_area_ratio",
+        type=float,
+        default=0.1,
+        help="最大框面积上限，merge 与最终 box 过滤共用（0表示不限制，默认: 0.1）"
     )
 
     # 增强检测参数
@@ -3742,6 +3790,7 @@ if __name__ == "__main__":
         placeholder_mode=args.placeholder_mode,
         optimize_iterations=args.optimize_iterations,
         merge_threshold=args.merge_threshold,
+        max_box_area_ratio=args.max_box_area_ratio,
         enable_enhanced_detection=args.enable_enhanced_detection,
         image_api_key=args.image_api_key,
         image_base_url=args.image_base_url,

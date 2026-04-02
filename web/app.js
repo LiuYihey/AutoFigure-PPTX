@@ -152,6 +152,12 @@
       const svgApiKey = $("svgApiKey").value.trim() || "";
 
       const samPromptVal = $("samPrompt") ? $("samPrompt").value.trim() : "";
+      const samMinScoreRaw = $("samMinScore") ? parseFloat($("samMinScore").value) : null;
+      const samMinScore = (!isNaN(samMinScoreRaw) && samMinScoreRaw !== null) ? samMinScoreRaw : null;
+      const maxBoxAreaRatioRaw = $("maxBoxAreaRatio") ? parseFloat($("maxBoxAreaRatio").value) : null;
+      const maxBoxAreaRatio = (!isNaN(maxBoxAreaRatioRaw) && maxBoxAreaRatioRaw !== null) ? maxBoxAreaRatioRaw : null;
+      const mergeThresholdRaw = $("mergeThreshold") ? parseFloat($("mergeThreshold").value) : null;
+      const mergeThreshold = (!isNaN(mergeThresholdRaw) && mergeThresholdRaw !== null) ? mergeThresholdRaw : null;
 
       const payload = {
         method_text: methodText,
@@ -169,6 +175,9 @@
         sam_backend: $("samBackend").value,
         sam_api_key: $("samApiKey").value.trim() || null,
         sam_prompt: samPromptVal || null,
+        sam_min_score: samMinScore,
+        max_box_area_ratio: maxBoxAreaRatio,
+        merge_threshold: mergeThreshold,
       };
       if (payload.sam_backend === "local") {
         payload.sam_api_key = null;

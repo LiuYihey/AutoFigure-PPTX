@@ -62,9 +62,11 @@ def _find_best_python() -> str:
 
 PYTHON_EXECUTABLE = _find_best_python()
 
-DEFAULT_SAM_PROMPT = "icon, illustration, person, robot, machine, device, animal"
+DEFAULT_SAM_PROMPT = "icon, illustration, person, robot, machine, device, animal, Signal, MRI"
 DEFAULT_PLACEHOLDER_MODE = "label"
-DEFAULT_MERGE_THRESHOLD = 0.01
+DEFAULT_MERGE_THRESHOLD = 0.3
+DEFAULT_MAX_BOX_AREA_RATIO = 0.1
+DEFAULT_SAM_MIN_SCORE = 0.2
 
 SVG_EDIT_CANDIDATES = [
     ("vendor/svg-edit/editor/index.html", WEB_DIR / "vendor" / "svg-edit" / "editor" / "index.html"),
@@ -118,8 +120,10 @@ class RunRequest(BaseModel):
     sam_backend: Optional[str] = None
     sam_api_key: Optional[str] = None
     sam_max_masks: Optional[int] = None
+    sam_min_score: Optional[float] = None
     placeholder_mode: Optional[str] = None
     merge_threshold: Optional[float] = None
+    max_box_area_ratio: Optional[float] = None
     optimize_iterations: Optional[int] = None
     reference_image_path: Optional[str] = None
     input_image_path: Optional[str] = None
@@ -186,10 +190,18 @@ def run_job(req: RunRequest) -> JSONResponse:
     merge_threshold = (
         req.merge_threshold if req.merge_threshold is not None else DEFAULT_MERGE_THRESHOLD
     )
+    max_box_area_ratio = (
+        req.max_box_area_ratio if req.max_box_area_ratio is not None else DEFAULT_MAX_BOX_AREA_RATIO
+    )
+    sam_min_score = (
+        req.sam_min_score if req.sam_min_score is not None else DEFAULT_SAM_MIN_SCORE
+    )
 
     cmd += ["--sam_prompt", sam_prompt]
     cmd += ["--placeholder_mode", placeholder_mode]
     cmd += ["--merge_threshold", str(merge_threshold)]
+    cmd += ["--max_box_area_ratio", str(max_box_area_ratio)]
+    cmd += ["--min_score", str(sam_min_score)]
     if req.sam_backend:
         cmd += ["--sam_backend", req.sam_backend]
     if req.sam_api_key:
