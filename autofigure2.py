@@ -310,9 +310,9 @@ def _call_openai_compatible_text(
     try:
         from openai import OpenAI
         
-        # 确保 base_url 以 /v1 结尾
+        # 确保 base_url 以版本路径结尾（如 /v1, /v3），但不重复追加
         normalized_base_url = base_url.rstrip('/')
-        if not normalized_base_url.endswith('/v1'):
+        if not re.search(r'/v\d+$', normalized_base_url):
             normalized_base_url = f"{normalized_base_url}/v1"
         
         client = OpenAI(
@@ -335,6 +335,17 @@ def _call_openai_compatible_text(
         raise
 
 
+def _is_deepseek_non_vision(base_url: str, model: str) -> bool:
+    """检测是否为 DeepSeek 非视觉模型（不支持 image_url）"""
+    if "deepseek" not in base_url.lower():
+        return False
+    # DeepSeek 视觉模型名称中通常包含 "vl"，如 deepseek-vl2, deepseek-vl2-plus
+    model_lower = model.lower()
+    if "vl" in model_lower:
+        return False
+    return True
+
+
 def _call_openai_compatible_multimodal(
     contents: List[Any],
     api_key: str,
@@ -348,10 +359,15 @@ def _call_openai_compatible_multimodal(
     try:
         from openai import OpenAI
         
-        # 确保 base_url 以 /v1 结尾
+        # 确保 base_url 以版本路径结尾（如 /v1, /v3），但不重复追加
         normalized_base_url = base_url.rstrip('/')
-        if not normalized_base_url.endswith('/v1'):
+        if not re.search(r'/v\d+$', normalized_base_url):
             normalized_base_url = f"{normalized_base_url}/v1"
+        
+        # DeepSeek 非视觉模型不支持 image_url，需要剥离图片内容
+        strip_images = _is_deepseek_non_vision(base_url, model)
+        if strip_images:
+            print(f"[{provider_label}] 模型 {model} 不支持图片输入，将仅发送文本内容")
         
         client = OpenAI(
             api_key=api_key,
@@ -365,18 +381,15 @@ def _call_openai_compatible_multimodal(
             if isinstance(part, str):
                 message_content.append({"type": "text", "text": part})
             elif isinstance(part, Image.Image):
+                if strip_images:
+                    print(f"[{provider_label}] 跳过图片内容（模型不支持视觉输入）")
+                    continue
                 buf = io.BytesIO()
-                image_format = 'JPEG' if provider_label == 'custom' else 'PNG'
-                image_for_upload = part.convert('RGB') if image_format == 'JPEG' else part
-                if provider_label == 'custom':
-                    image_for_upload = image_for_upload.copy()
-                    image_for_upload.thumbnail((128, 128))
-                image_for_upload.save(buf, format=image_format, quality=85)
+                part.save(buf, format='PNG')
                 image_b64 = base64.b64encode(buf.getvalue()).decode('utf-8')
-                media_type = 'image/jpeg' if image_format == 'JPEG' else 'image/png'
                 message_content.append({
                     "type": "image_url",
-                    "image_url": {"url": f"data:{media_type};base64,{image_b64}"}
+                    "image_url": {"url": f"data:image/png;base64,{image_b64}"}
                 })
         
         completion = client.chat.completions.create(
@@ -405,9 +418,9 @@ def _call_openai_compatible_image_generation(
         from openai import OpenAI
         import re
         
-        # 确保 base_url 以 /v1 结尾
+        # 确保 base_url 以版本路径结尾（如 /v1, /v3），但不重复追加
         normalized_base_url = base_url.rstrip('/')
-        if not normalized_base_url.endswith('/v1'):
+        if not re.search(r'/v\d+$', normalized_base_url):
             normalized_base_url = f"{normalized_base_url}/v1"
             
         import httpx
@@ -705,7 +718,9 @@ def _call_anthropic_text(
         result = response.json()
         
         if "content" in result and len(result["content"]) > 0:
-            return result["content"][0]["text"]
+            for block in result["content"]:
+                if isinstance(block, dict) and "text" in block:
+                    return block["text"]
         return None
     except Exception as e:
         print(f"[Anthropic] 文本 API 调用失败: {e}")
@@ -768,7 +783,9 @@ def _call_anthropic_multimodal(
         result = response.json()
         
         if "content" in result and len(result["content"]) > 0:
-            return result["content"][0]["text"]
+            for block in result["content"]:
+                if isinstance(block, dict) and "text" in block:
+                    return block["text"]
         return None
     except Exception as e:
         print(f"[Anthropic] 多模态 API 调用失败: {e}")
@@ -2075,9 +2092,15 @@ OUTPUT FORMAT:
         if not svg_code:
             raise Exception('API 响应中没有内容，生成 SVG 失败。')
 
-        svg_code = extract_svg_code(svg_code)
-        if not svg_code:
+        extracted = extract_svg_code(svg_code)
+        if not extracted:
+            preview_head = svg_code[:500].replace('\n', '\\n')
+            preview_tail = svg_code[-200:].replace('\n', '\\n') if len(svg_code) > 200 else ""
+            print(f"  [调试] API 返回内容共 {len(svg_code)} 字符，未找到 <svg")
+            print(f"  [调试] 内容开头: {preview_head}")
+            print(f"  [调试] 内容结尾: {preview_tail}")
             raise Exception('无法从多模态 API 响应中提取有效的 SVG 代码。')
+        svg_code = extracted
 
         print(f"  [label 模式] SVG 拼装完成，尺寸={len(svg_code)} 字节")
 
@@ -2453,7 +2476,7 @@ def fix_svg_with_llm(
         normalized_base_url = "https://api.openai.com/v1"
     else:
         normalized_base_url = base_url.rstrip('/')
-        if not normalized_base_url.endswith('/v1'):
+        if not re.search(r'/v\d+$', normalized_base_url):
             normalized_base_url = f"{normalized_base_url}/v1"
         
     client = OpenAI(
@@ -3460,17 +3483,9 @@ def method_to_svg(
         )
 
     if len(valid_boxes) == 0:
-        print("\n警告: 没有检测到有效的图标，流程终止")
-        return {
-            "figure_path": str(figure_path),
-            "samed_path": samed_path,
-            "boxlib_path": boxlib_path,
-            "icon_infos": [],
-            "template_svg_path": None,
-            "final_svg_path": None,
-        }
-
-    print(f"\n检测到 {len(valid_boxes)} 个图标")
+        print("\n警告: 没有检测到有效的图标，将继续使用原始图像生成 SVG（无图标替换）")
+    else:
+        print(f"\n检测到 {len(valid_boxes)} 个图标")
 
     if stop_after == 2:
         print("\n" + "=" * 60)
