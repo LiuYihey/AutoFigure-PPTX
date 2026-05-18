@@ -2139,6 +2139,13 @@ CORE REQUIREMENT — PURE SVG (VERY IMPORTANT):
 - Do NOT embed any PNG or raster image as a background layer (no <image href="data:...">, no base64 blobs).
 - The output SVG must be fully editable — every element independently selectable and movable.
 
+SHAPE FIDELITY — ROUNDED CORNERS (CRITICAL):
+- Carefully observe the corner radius of EVERY rectangular box, panel and pill-shaped element.
+- If a box in the original image has rounded corners, the corresponding <rect> MUST keep them — set rx (and ry if different) to a value that visually matches the source. Do NOT silently turn rounded boxes into sharp 90° corners.
+- Match the roundness magnitude: tight rounded (small rx ~4–8), moderately rounded (rx ~10–18), strongly rounded/pill (rx ≈ half of the shorter side).
+- Sharp-cornered rectangles must stay sharp (omit rx/ry); never add roundness that isn't in the source.
+- Apply the same rule to grouped panels and container frames drawn with <path> — preserve their rounded corner arcs.
+
 TEXT FIDELITY (CRITICAL — DO NOT VIOLATE):
 - ONLY include text that is CLEARLY VISIBLE and LEGIBLE in the original image.
 - Copy every text string CHARACTER FOR CHARACTER exactly as it appears. Do NOT paraphrase, translate, summarize, or reword any text.
