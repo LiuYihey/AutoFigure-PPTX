@@ -237,6 +237,8 @@ def run_job(req: RunRequest) -> JSONResponse:
 
     env = os.environ.copy()
     env["PYTHONUNBUFFERED"] = "1"
+    # 子进程若段错误，向 stderr 打印 Python/C 栈（便于排查 SAM3 / torch 原生崩溃）
+    env.setdefault("PYTHONFAULTHANDLER", "1")
 
     log_path = output_dir / "run.log"
     log_path.write_text(
@@ -318,11 +320,16 @@ def stream_events(job_id: str) -> StreamingResponse:
 @app.get("/api/artifacts/{job_id}/{path:path}")
 def get_artifact(job_id: str, path: str) -> Response:
     job = JOBS.get(job_id)
-    if not job:
-        raise HTTPException(status_code=404, detail="Job not found")
+    if job:
+        output_dir = job.output_dir
+    else:
+        # 允许刷新/重启后仅通过磁盘上的 outputs/<job_id>/ 访问（画布页会拉取 final.svg）
+        output_dir = OUTPUTS_DIR / job_id
+        if not output_dir.is_dir():
+            raise HTTPException(status_code=404, detail="Job not found")
 
-    candidate = (job.output_dir / path).resolve()
-    if not str(candidate).startswith(str(job.output_dir.resolve())):
+    candidate = (output_dir / path).resolve()
+    if not str(candidate).startswith(str(output_dir.resolve())):
         raise HTTPException(status_code=400, detail="Invalid path")
     if not candidate.is_file():
         raise HTTPException(status_code=404, detail="File not found")

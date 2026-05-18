@@ -74,6 +74,8 @@ import re
 import shutil
 import subprocess
 import sys
+import time
+import traceback
 from pathlib import Path
 from typing import Optional, List, Dict, Any, Literal
 
@@ -463,12 +465,71 @@ def _call_openai_compatible_image_generation(
                     return None
             return None
         
-        # 注意：reference_image 在标准 OpenAI images API 中不支持
-        if reference_image is not None:
+        # gpt-image-* (例如 gpt-image-1 / gpt-image-2) 支持通过
+        # POST /v1/images/edits 上传一张或多张参考图（multipart）。
+        # 参见 image-2/call_gpt_image.py。
+        if reference_image is not None and "gpt-image" in model.lower():
+            edits_url = f"{normalized_base_url}/images/edits"
+            print(f"[{provider_label}] 检测到 {model} 模型 + reference_image，使用 /images/edits 多部分上传: {edits_url}")
+
+            buf = io.BytesIO()
+            ref_for_edit = reference_image
+            if ref_for_edit.mode in ("RGBA", "P"):
+                ref_for_edit = ref_for_edit.convert("RGBA").convert("RGB")
+            elif ref_for_edit.mode != "RGB":
+                ref_for_edit = ref_for_edit.convert("RGB")
+            ref_for_edit.save(buf, format="PNG", optimize=True, compress_level=6)
+            ref_png_bytes = buf.getvalue()
+
+            headers = {"Authorization": f"Bearer {api_key}"}
+            form_data = {
+                "model": model,
+                "prompt": prompt,
+                "n": "1",
+                "response_format": "b64_json",
+            }
+
+            last_err: Optional[str] = None
+            # 一些中转网关要求 multipart 字段名为 image[]，另一些要求重复的 image；
+            # 这里依次尝试，并对 4xx 错误带上响应文本，便于排查。
+            for field_name in ("image[]", "image"):
+                files = [(field_name, ("reference.png", ref_png_bytes, "image/png"))]
+                try:
+                    resp = requests.post(
+                        edits_url,
+                        headers=headers,
+                        files=files,
+                        data=form_data,
+                        timeout=300,
+                    )
+                except requests.exceptions.RequestException as exc:
+                    last_err = f"{exc.__class__.__name__}: {exc}"
+                    print(f"[{provider_label}] /images/edits 请求失败 (field={field_name}): {last_err}")
+                    continue
+
+                if resp.status_code == 200:
+                    data_json = resp.json()
+                    items = data_json.get("data") or []
+                    if items and items[0].get("b64_json"):
+                        img_data = base64.b64decode(items[0]["b64_json"])
+                        return Image.open(io.BytesIO(img_data)).convert("RGB")
+                    last_err = f"HTTP 200 but empty data: {data_json}"
+                    print(f"[{provider_label}] /images/edits 返回 200 但无 b64_json")
+                    break
+
+                last_err = f"HTTP {resp.status_code} {resp.text[:500]}"
+                print(f"[{provider_label}] /images/edits 失败 (field={field_name}): {last_err}")
+                # 401/404/501 这种没必要再换字段名重试
+                if resp.status_code in (401, 403, 404, 501):
+                    break
+
+            print(f"[{provider_label}] /images/edits 全部尝试失败，回退到 /images/generations（忽略参考图）: {last_err}")
+
+        if reference_image is not None and "gpt-image" not in model.lower():
             print(f"[{provider_label}] 警告：标准图像生成 API 不支持参考图片，将忽略 reference_image")
-        
+
         print(f"[{provider_label}] 调用图像生成 API: {normalized_base_url}/images/generations")
-        
+
         response = client.images.generate(
             model=model,
             prompt=prompt,
@@ -1089,6 +1150,23 @@ The figure should be engaging and using academic journal style with cute charact
 # 步骤二：SAM3 分割 + Box合并 + 灰色填充+黑色边框+序号标记
 # ============================================================================
 
+def _process_rss_gib() -> float | None:
+    """Best-effort RSS for diagnosing OOM / swap thrashing during SAM3 load."""
+    try:
+        import psutil
+
+        return psutil.Process().memory_info().rss / (1024**3)
+    except Exception:
+        return None
+
+
+def _sam_local_debug(msg: str, t0: float) -> None:
+    elapsed = time.perf_counter() - t0
+    rss = _process_rss_gib()
+    rss_part = f"RSS={rss:.2f}GiB" if rss is not None else "RSS=n/a"
+    print(f"[SAM3-local] +{elapsed:7.1f}s {rss_part} | {msg}", flush=True)
+
+
 def get_label_font(box_width: int, box_height: int) -> ImageFont.FreeTypeFont:
     """
     根据 box 尺寸动态计算合适的字体大小
@@ -1567,66 +1645,112 @@ def segment_with_sam3(
         backend = "fal"
 
     if backend == "local":
-        from sam3.model_builder import build_sam3_image_model
-        from sam3.model.sam3_image_processor import Sam3Processor
-        import sam3
+        t_sam0 = time.perf_counter()
+        try:
+            print(
+                f"[SAM3-local] start | torch={torch.__version__} "
+                f"cuda={'1' if torch.cuda.is_available() else '0'} "
+                f"threads={torch.get_num_threads()}",
+                flush=True,
+            )
+            _sam_local_debug("importing sam3 (model_builder, processor…)", t_sam0)
 
-        sam3_dir = Path(sam3.__path__[0]) if hasattr(sam3, '__path__') else Path(sam3.__file__).parent
-        bpe_path = sam3_dir / "assets" / "bpe_simple_vocab_16e6.txt.gz"
-        if not bpe_path.exists():
-            bpe_path = None
-            print("警告: 未找到 bpe 文件，使用默认路径")
+            from sam3.model_builder import build_sam3_image_model
+            from sam3.model.sam3_image_processor import Sam3Processor
+            import sam3
 
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        print(f"使用设备: {device}")
-        
-        local_sam3_ckpt = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models", "sam3", "sam3.pt")
-        if os.path.exists(local_sam3_ckpt):
-            print(f"加载本地 SAM3 权重: {local_sam3_ckpt}")
-            model = build_sam3_image_model(device=device, bpe_path=str(bpe_path) if bpe_path else None, checkpoint_path=local_sam3_ckpt, load_from_HF=False)
-        else:
-            model = build_sam3_image_model(device=device, bpe_path=str(bpe_path) if bpe_path else None)
-            
-        processor = Sam3Processor(model, device=device, confidence_threshold=min_score)
-        inference_state = processor.set_image(image.convert("RGB") if image.mode != "RGB" else image)
+            _sam_local_debug("sam3 modules imported", t_sam0)
 
-        for prompt in prompt_list:
-            print(f"\n  正在检测: '{prompt}'")
-            output = processor.set_text_prompt(state=inference_state, prompt=prompt)
+            sam3_dir = Path(sam3.__path__[0]) if hasattr(sam3, "__path__") else Path(sam3.__file__).parent
+            bpe_path = sam3_dir / "assets" / "bpe_simple_vocab_16e6.txt.gz"
+            if not bpe_path.exists():
+                bpe_path = None
+                print("警告: 未找到 bpe 文件，使用默认路径", flush=True)
 
-            boxes = output["boxes"]
-            scores = output["scores"]
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+            print(f"使用设备: {device}", flush=True)
 
-            if isinstance(boxes, torch.Tensor):
-                boxes = boxes.cpu().numpy()
-            if isinstance(scores, torch.Tensor):
-                scores = scores.cpu().numpy()
+            local_sam3_ckpt = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models", "sam3", "sam3.pt")
+            ckpt_exists = os.path.exists(local_sam3_ckpt)
+            if ckpt_exists:
+                try:
+                    ckpt_bytes = os.path.getsize(local_sam3_ckpt)
+                    print(f"加载本地 SAM3 权重: {local_sam3_ckpt} ({ckpt_bytes / (1024**3):.2f} GiB on disk)", flush=True)
+                except OSError:
+                    print(f"加载本地 SAM3 权重: {local_sam3_ckpt}", flush=True)
+                _sam_local_debug("calling build_sam3_image_model (ViT+encoder build + torch.load + .to(device) — CPU 上可能数分钟且无输出)", t_sam0)
+                model = build_sam3_image_model(
+                    device=device,
+                    bpe_path=str(bpe_path) if bpe_path else None,
+                    checkpoint_path=local_sam3_ckpt,
+                    load_from_HF=False,
+                )
+            else:
+                print("未找到本地 sam3.pt，将从 HuggingFace 拉取权重", flush=True)
+                _sam_local_debug("calling build_sam3_image_model (HF download + load)", t_sam0)
+                model = build_sam3_image_model(device=device, bpe_path=str(bpe_path) if bpe_path else None)
 
-            prompt_count = 0
-            img_area = original_size[0] * original_size[1]
-            for box, score in zip(boxes, scores):
-                if score >= min_score:
-                    x1, y1, x2, y2 = int(box[0]), int(box[1]), int(box[2]), int(box[3])
-                    box_area = (x2 - x1) * (y2 - y1)
-                    if img_area > 0 and (box_area / img_area) > 0.7:
-                        print(f"    跳过: 框过大 ({box_area/img_area:.1%} 超过70%图像面积)")
-                        continue
-                    all_detected_boxes.append({
-                        "x1": x1, "y1": y1, "x2": x2, "y2": y2,
-                        "score": float(score),
-                        "prompt": prompt  # 记录来源 prompt
-                    })
-                    prompt_count += 1
-                    print(f"    对象 {prompt_count}: ({x1}, {y1}, {x2}, {y2}), score={score:.3f}")
-                else:
-                    print(f"    跳过: score={score:.3f} < {min_score}")
+            _sam_local_debug("build_sam3_image_model finished", t_sam0)
 
-            print(f"  '{prompt}' 检测到 {prompt_count} 个有效对象")
-            total_detected += prompt_count
+            _sam_local_debug("constructing Sam3Processor", t_sam0)
+            processor = Sam3Processor(model, device=device, confidence_threshold=min_score)
+            _sam_local_debug("Sam3Processor ready", t_sam0)
 
-        del model, processor
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+            rgb = image.convert("RGB") if image.mode != "RGB" else image
+            _sam_local_debug("processor.set_image (backbone forward) starting", t_sam0)
+            inference_state = processor.set_image(rgb)
+            _sam_local_debug("processor.set_image done", t_sam0)
+
+            for prompt in prompt_list:
+                print(f"\n  正在检测: '{prompt}'", flush=True)
+                _sam_local_debug(f"set_text_prompt prompt={prompt!r}", t_sam0)
+                output = processor.set_text_prompt(state=inference_state, prompt=prompt)
+
+                boxes = output["boxes"]
+                scores = output["scores"]
+
+                if isinstance(boxes, torch.Tensor):
+                    boxes = boxes.cpu().numpy()
+                if isinstance(scores, torch.Tensor):
+                    scores = scores.cpu().numpy()
+
+                prompt_count = 0
+                img_area = original_size[0] * original_size[1]
+                for box, score in zip(boxes, scores):
+                    if score >= min_score:
+                        x1, y1, x2, y2 = int(box[0]), int(box[1]), int(box[2]), int(box[3])
+                        box_area = (x2 - x1) * (y2 - y1)
+                        if img_area > 0 and (box_area / img_area) > 0.7:
+                            print(f"    跳过: 框过大 ({box_area/img_area:.1%} 超过70%图像面积)")
+                            continue
+                        all_detected_boxes.append(
+                            {
+                                "x1": x1,
+                                "y1": y1,
+                                "x2": x2,
+                                "y2": y2,
+                                "score": float(score),
+                                "prompt": prompt,
+                            }
+                        )
+                        prompt_count += 1
+                        print(f"    对象 {prompt_count}: ({x1}, {y1}, {x2}, {y2}), score={score:.3f}")
+                    else:
+                        print(f"    跳过: score={score:.3f} < {min_score}")
+
+                print(f"  '{prompt}' 检测到 {prompt_count} 个有效对象")
+                total_detected += prompt_count
+
+            del model, processor
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            _sam_local_debug("local SAM3 loop complete", t_sam0)
+        except Exception:
+            print("[SAM3-local] 步骤二本地 SAM 失败，完整异常如下:", flush=True)
+            traceback.print_exc()
+            sys.stdout.flush()
+            sys.stderr.flush()
+            raise
 
     elif backend == "fal":
         api_key = _get_fal_api_key(sam_api_key)

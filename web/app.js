@@ -439,12 +439,51 @@
 
     let svgReady = false;
     let pendingSvgText = null;
+    /** 2 = final.svg, 1 = template — 避免 template 覆盖已排队的 final */
+    let pendingSvgPriority = 0;
+
+    function setPendingSvg(svgText, priority) {
+      if (priority >= pendingSvgPriority) {
+        pendingSvgText = svgText;
+        pendingSvgPriority = priority;
+      }
+    }
+
+    /**
+     * SVG-Edit 的线框模式会通过 CSS 强制 fill:none，覆盖图形上的填色。
+     * 用户偏好或误触可能持久化开启线框；在画布页强制恢复到正常着色模式。
+     */
+    function ensureSvgEditWireframeOff(win) {
+      try {
+        const ed = win.svgEditor;
+        if (!ed?.workarea || !ed.topPanel || typeof ed.topPanel.clickWireframe !== "function") {
+          return;
+        }
+        if (ed.workarea.classList.contains("wireframe")) {
+          ed.topPanel.clickWireframe();
+        }
+      } catch (_) {
+        /* ignore cross-origin or partial init */
+      }
+    }
+
+    function scheduleSvgEditWireframeOff(win) {
+      if (!win) {
+        return;
+      }
+      [0, 80, 250, 500].forEach((ms) => {
+        setTimeout(() => ensureSvgEditWireframeOff(win), ms);
+      });
+    }
 
     iframe.addEventListener("load", () => {
       svgReady = true;
-      if (pendingSvgText) {
-        tryLoadSvg(pendingSvgText);
-        pendingSvgText = null;
+      scheduleSvgEditWireframeOff(iframe.contentWindow);
+      const queued = pendingSvgText;
+      pendingSvgText = null;
+      pendingSvgPriority = 0;
+      if (queued) {
+        void tryLoadSvg(queued);
       }
     });
 
@@ -528,11 +567,12 @@
           return;
         }
         if (!svgReady) {
-          pendingSvgText = svgText;
+          const pri = url.includes("final.svg") ? 2 : 1;
+          setPendingSvg(svgText, pri);
           return;
         }
 
-        const loaded = tryLoadSvg(svgText);
+        const loaded = await tryLoadSvg(svgText);
         if (!loaded) {
           iframe.src = `${svgEditPath}?url=${encodeURIComponent(url)}`;
         }
@@ -541,22 +581,57 @@
       }
     }
 
-    function tryLoadSvg(svgText) {
+    async function tryLoadSvg(svgText) {
       if (!iframe.contentWindow) {
         return false;
       }
 
       const win = iframe.contentWindow;
       if (win.svgEditor && typeof win.svgEditor.loadFromString === "function") {
-        win.svgEditor.loadFromString(svgText);
+        await win.svgEditor.loadFromString(svgText);
+        scheduleSvgEditWireframeOff(win);
         return true;
       }
       if (win.svgCanvas && typeof win.svgCanvas.setSvgString === "function") {
-        win.svgCanvas.setSvgString(svgText);
+        const maybePromise = win.svgCanvas.setSvgString(svgText);
+        if (maybePromise && typeof maybePromise.then === "function") {
+          await maybePromise;
+        }
+        scheduleSvgEditWireframeOff(win);
         return true;
       }
       return false;
     }
+
+    /**
+     * 打开画布时若 job 已在磁盘上生成 final.svg（刷新、重启 SSE 无回放），主动拉取并装入编辑器。
+     */
+    async function bootstrapFinalFromDisk() {
+      if (!jobId || !svgEditAvailable) {
+        return;
+      }
+      const url = `/api/artifacts/${encodeURIComponent(jobId)}/final.svg`;
+      try {
+        const response = await fetch(url);
+        if (!response.ok) {
+          return;
+        }
+        const svgText = await response.text();
+        saveSvgBtn.style.display = "";
+        downloadSvgBtn.style.display = "";
+        exportPngBtn.style.display = "";
+        if (exportPptxBtn) exportPptxBtn.style.display = "";
+        if (!svgReady) {
+          setPendingSvg(svgText, 2);
+          return;
+        }
+        await tryLoadSvg(svgText);
+      } catch (_) {
+        /* 磁盘上无 final 或网络错误 — 忽略，由 SSE 后续推送 */
+      }
+    }
+
+    void bootstrapFinalFromDisk();
   }
 
   function appendLogLine(container, data) {
