@@ -77,27 +77,6 @@ pip install svg2ooxml
 
 如果 Python 3.13 不在默认安装位置，设置 `AUTOFIGURE_PY313` 指向对应的 `python.exe`。
 
-## 关于 API Key
-
-仓库不包含任何密钥或私有端点。界面中的 Provider / Base URL / API Key 默认留空，请在本地填写。
-
-如果希望本机每次打开都自动预填，可创建 **不会被 git 跟踪** 的 `web/local-config.js`：
-
-```js
-(() => {
-  const set = (id, value) => {
-    const el = document.getElementById(id);
-    if (el) el.value = value;
-  };
-  set("imageProvider", "custom");
-  set("imageBaseUrl", "https://your-endpoint");
-  set("imageApiKey", "sk-...");
-  set("imageModel", "gpt-image-2.6-sunburst");
-})();
-```
-
-该文件已加入 `.gitignore`，提交前无需再做额外处理。
-
 ## 目录结构
 
 ```text
@@ -113,7 +92,3 @@ AutoFigure-Edit/
 ├─ models/                # 本地模型（不随仓库分发）
 └─ outputs/               # 每次任务的输出
 ```
-
-## 来源与许可
-
-本项目 fork 自 [ResearAI/AutoFigure-Edit](https://github.com/ResearAI/AutoFigure-Edit)，遵循 MIT License。原始工作为 ICLR 2026 论文 *AutoFigure*；如果它对你的研究有帮助，请引用原论文并给上游仓库一个 Star。
