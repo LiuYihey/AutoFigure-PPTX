@@ -21,7 +21,7 @@
           <button class="ghost" id="saveSvgBtn" style="display:none">Save SVG</button>
           <button class="ghost" id="downloadSvgBtn" style="display:none">Download SVG</button>
           <button class="ghost" id="exportPngBtn" style="display:none">Export PNG (4×)</button>
-          <button class="ghost" id="exportPptxBtn" style="display:none">Export PPTX (Editable SVG)</button>
+          <button class="ghost" id="exportPptxBtn" style="display:none">Export PPTX</button>
           <div class="job-pill">Job <span id="jobId"></span></div>
         </div>
       </header>
@@ -61,6 +61,29 @@
         <div class="panel-header">Logs</div>
         <div class="log-body" id="logBody"></div>
       </aside>
+    </div>
+
+    <!-- Image confirmation modal (preview mode) -->
+    <div class="confirm-overlay" id="confirmOverlay" hidden>
+      <div class="confirm-modal">
+        <div class="confirm-header">
+          <span class="confirm-title">AI 生图完成</span>
+          <span class="confirm-subtitle">请确认图片效果，或调整文本重新生成</span>
+        </div>
+        <div class="confirm-image-wrap">
+          <img id="confirmImage" class="confirm-image" alt="Generated figure" />
+        </div>
+        <div class="confirm-actions" id="confirmActions">
+          <button class="primary" id="confirmContinueBtn">确认并继续</button>
+          <button class="ghost" id="confirmAdjustBtn">调整文本重新生成</button>
+        </div>
+        <div class="adjust-panel" id="adjustPanel" hidden>
+          <label class="field-label" for="adjustMethodText">Method Text / 提示文本</label>
+          <textarea id="adjustMethodText" class="textarea" rows="6" style="min-height:120px;"></textarea>
+          <button class="primary" id="regenerateBtn" style="margin-top:12px;">重新生成图片</button>
+        </div>
+        <div class="confirm-status" id="confirmStatus"></div>
+      </div>
     </div>
 
     <script src="/app.js"></script>

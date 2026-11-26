@@ -183,6 +183,13 @@
         payload.sam_api_key = null;
       }
 
+      // New flow: if using AI image generation (no uploaded input image),
+      // only run step 1 first, then let user confirm before continuing.
+      const usePreviewFlow = !uploadedInputImagePath;
+      if (usePreviewFlow) {
+        payload.stop_after = 1;
+      }
+
       try {
         const response = await fetch("/api/run", {
           method: "POST",
@@ -196,7 +203,20 @@
         }
 
         const data = await response.json();
-        window.location.href = `/canvas.html?job=${encodeURIComponent(data.job_id)}`;
+
+        // Save config for confirm/regenerate actions on canvas page
+        try {
+          sessionStorage.setItem("autofigure_last_config", JSON.stringify(payload));
+          sessionStorage.setItem("autofigure_last_method", methodText);
+        } catch (_) {
+          /* sessionStorage might be unavailable */
+        }
+
+        const params = new URLSearchParams({ job: data.job_id });
+        if (usePreviewFlow) {
+          params.set("mode", "preview");
+        }
+        window.location.href = `/canvas.html?${params.toString()}`;
       } catch (err) {
         errorMsg.textContent = err.message || "Failed to start job";
         confirmBtn.disabled = false;
@@ -268,6 +288,133 @@
     }
 
     jobIdEl.textContent = jobId;
+
+    // ===== Preview mode: confirm AI image before continuing =====
+    const previewMode = params.get("mode") === "preview";
+    const confirmOverlay = $("confirmOverlay");
+    const confirmImage = $("confirmImage");
+    const confirmContinueBtn = $("confirmContinueBtn");
+    const confirmAdjustBtn = $("confirmAdjustBtn");
+    const adjustPanel = $("adjustPanel");
+    const adjustMethodText = $("adjustMethodText");
+    const regenerateBtn = $("regenerateBtn");
+    const confirmStatus = $("confirmStatus");
+    let figureUrl = null;
+
+    function maybeShowConfirmModal() {
+      if (!previewMode || !figureUrl || !isFinished) return;
+      if (confirmOverlay && confirmOverlay.hasAttribute("hidden")) {
+        confirmImage.src = figureUrl;
+        confirmOverlay.removeAttribute("hidden");
+        // Pre-fill adjust textarea with last method text
+        try {
+          const lastMethod = sessionStorage.getItem("autofigure_last_method");
+          if (lastMethod && adjustMethodText) {
+            adjustMethodText.value = lastMethod;
+          }
+        } catch (_) { /* ignore */ }
+      }
+    }
+
+    function setConfirmStatus(text) {
+      if (confirmStatus) confirmStatus.textContent = text || "";
+    }
+
+    function getLastConfig() {
+      try {
+        const raw = sessionStorage.getItem("autofigure_last_config");
+        return raw ? JSON.parse(raw) : null;
+      } catch (_) {
+        return null;
+      }
+    }
+
+    if (confirmContinueBtn) {
+      confirmContinueBtn.addEventListener("click", async () => {
+        const config = getLastConfig();
+        if (!config) {
+          setConfirmStatus("无法读取配置，请返回首页重新操作");
+          return;
+        }
+        confirmContinueBtn.disabled = true;
+        confirmAdjustBtn.disabled = true;
+        setConfirmStatus("正在启动后续步骤...");
+        try {
+          const res = await fetch("/api/run", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              ...config,
+              resume_dir: jobId,
+              stop_after: 5,
+              input_image_path: null,
+              reference_image_path: null,
+            }),
+          });
+          if (!res.ok) throw new Error(await res.text() || "Request failed");
+          const data = await res.json();
+          window.location.href = `/canvas.html?job=${encodeURIComponent(data.job_id)}`;
+        } catch (err) {
+          setConfirmStatus(err.message || "启动失败");
+          confirmContinueBtn.disabled = false;
+          confirmAdjustBtn.disabled = false;
+        }
+      });
+    }
+
+    if (confirmAdjustBtn) {
+      confirmAdjustBtn.addEventListener("click", () => {
+        if (adjustPanel) adjustPanel.hidden = false;
+        if (adjustMethodText) adjustMethodText.focus();
+      });
+    }
+
+    if (regenerateBtn) {
+      regenerateBtn.addEventListener("click", async () => {
+        const config = getLastConfig();
+        if (!config) {
+          setConfirmStatus("无法读取配置，请返回首页重新操作");
+          return;
+        }
+        const newMethod = adjustMethodText ? adjustMethodText.value.trim() : "";
+        if (!newMethod) {
+          setConfirmStatus("请输入文本内容");
+          return;
+        }
+        regenerateBtn.disabled = true;
+        confirmContinueBtn.disabled = true;
+        setConfirmStatus("正在重新生成图片...");
+        try {
+          const res = await fetch("/api/run", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              ...config,
+              method_text: newMethod,
+              stop_after: 1,
+              resume_dir: null,
+              input_image_path: null,
+              reference_image_path: null,
+            }),
+          });
+          if (!res.ok) throw new Error(await res.text() || "Request failed");
+          const data = await res.json();
+          try {
+            sessionStorage.setItem("autofigure_last_method", newMethod);
+            sessionStorage.setItem("autofigure_last_config", JSON.stringify({
+              ...config,
+              method_text: newMethod,
+            }));
+          } catch (_) { /* ignore */ }
+          window.location.href = `/canvas.html?job=${encodeURIComponent(data.job_id)}&mode=preview`;
+        } catch (err) {
+          setConfirmStatus(err.message || "重新生成失败");
+          regenerateBtn.disabled = false;
+          confirmContinueBtn.disabled = false;
+        }
+      });
+    }
+    // ===== End preview mode setup =====
 
     toggle.addEventListener("click", () => {
       artifactPanel.classList.toggle("open");
@@ -408,10 +555,10 @@
           a.click();
           URL.revokeObjectURL(url);
           exportPptxBtn.textContent = "Exported ✓";
-          setTimeout(() => { exportPptxBtn.textContent = "Export PPTX (Editable SVG)"; exportPptxBtn.disabled = false; }, 2000);
+          setTimeout(() => { exportPptxBtn.textContent = "Export PPTX"; exportPptxBtn.disabled = false; }, 2000);
         } catch (e) {
           alert("PPTX 导出出错: " + e);
-          exportPptxBtn.textContent = "Export PPTX (Editable SVG)";
+          exportPptxBtn.textContent = "Export PPTX";
           exportPptxBtn.disabled = false;
         }
       });
@@ -431,11 +578,26 @@
     }
 
     if (svgEditAvailable && svgEditPath) {
-      iframe.src = svgEditPath;
+      // 禁用 SVG-Edit 的本地存储（storagePrompt=false 阻止弹窗请求存储；
+      // noStorageOnLoad=true 禁止其从 localStorage 恢复上一次的 SVG 内容，
+      // 避免新任务画布先显示上一次结果、直到新结果推送才被覆盖）。
+      iframe.src = svgEditPath + (svgEditPath.includes("?") ? "&" : "?") + "storagePrompt=false&noStorageOnLoad=true";
     } else {
       fallback.classList.add("active");
       iframe.style.display = "none";
     }
+
+    // 清理 SVG-Edit 曾写入的遗留内容（用户以前同意过存储时），
+    // 保证画布从空白开始。cookie 需按 iframe 路径一并清除。
+    try {
+      if (window.localStorage) {
+        localStorage.removeItem("svgedit-default");
+        localStorage.removeItem("title-svgedit-default");
+      }
+      ["/", "/vendor/svg-edit/", "/vendor/svg-edit/editor/", "/vendor/svg-edit/editor/index.html"].forEach((p) => {
+        document.cookie = "svgeditstore=; expires=Thu, 01 Jan 1970 00:00:00 GMT; path=" + p;
+      });
+    } catch (_) { /* localStorage 可能被禁用，忽略 */ }
 
     let svgReady = false;
     let pendingSvgText = null;
@@ -476,14 +638,111 @@
       });
     }
 
+    /**
+     * 将视图缩放至完整显示 SVG 画布内容（默认视图改进）。
+     * SVG-Edit 默认以 100% 加载，大尺寸 SVG 会被裁切；这里计算 workarea
+     * 视口与画布的比例，自动缩放到 ~95% 适配并居中。
+     */
+    function fitSvgToView(win) {
+      if (!win) return;
+      try {
+        const ed = win.svgEditor;
+        const canvas = ed?.svgCanvas || win.svgCanvas;
+        if (!canvas || !ed?.workarea) return;
+        const res = canvas.getResolution();
+        if (!res || !res.w || !res.h) return;
+        const vw = ed.workarea.clientWidth;
+        const vh = ed.workarea.clientHeight;
+        if (!vw || !vh) return;
+        // 留 5% 边距，保证完整可见
+        const fitZoom = Math.min(vw / res.w, vh / res.h) * 0.95;
+        // 限制在合理范围 5%–800%
+        const clamped = Math.max(0.05, Math.min(8, fitZoom));
+        if (canvas.setCurrentZoom) {
+          canvas.setCurrentZoom(clamped);
+        } else if (canvas.setZoom) {
+          canvas.setZoom(clamped);
+          const zoomInput = win.document.getElementById("zoom");
+          if (zoomInput) zoomInput.value = (clamped * 100).toFixed(1);
+        }
+        // 居中画布
+        if (typeof ed.updateCanvas === "function") {
+          ed.updateCanvas(true);
+        }
+      } catch (_) { /* iframe 可能尚未就绪，忽略 */ }
+    }
+
+    /**
+     * 注入 Ctrl+滚轮缩放支持到 SVG-Edit iframe。
+     * SVG-Edit 原生仅支持 Shift+滚轮缩放；现代用户更习惯 Ctrl+滚轮。
+     * 使用 capture 阶段拦截，避免触发浏览器页面缩放和 SVG-Edit 的 shift 处理。
+     */
+    let ctrlWheelAttached = false;
+    function attachCtrlWheelZoom(win) {
+      if (!win || ctrlWheelAttached) return;
+      try {
+        const doc = win.document;
+        if (!doc) return;
+        doc.addEventListener("wheel", (e) => {
+          if (!e.ctrlKey) return;
+          e.preventDefault();
+          e.stopPropagation();
+          const ed = win.svgEditor;
+          if (!ed || typeof ed.zoomImage !== "function") return;
+          // 向上滚（deltaY < 0）放大，向下滚缩小；每档 1.1 倍
+          const factor = e.deltaY < 0 ? 1.1 : 0.9;
+          ed.zoomImage(factor);
+        }, { capture: true, passive: false });
+        ctrlWheelAttached = true;
+      } catch (_) { /* 跨域或部分初始化，忽略 */ }
+    }
+
+    /**
+     * 修复 Del/Backspace 删除元素。
+     * SVG-Edit 内置的删除快捷键仅在 keydown 目标为 BODY 时生效；
+     * 点击画布上的图形后焦点落在 SVG 元素上，导致 Del 无效。
+     * 这里在 iframe 文档上补一个监听，直接调用 svgCanvas.deleteSelectedElements()。
+     */
+    let deleteKeyAttached = false;
+    function attachDeleteKey(win) {
+      if (!win || deleteKeyAttached) return;
+      try {
+        const doc = win.document;
+        if (!doc) return;
+        doc.addEventListener("keydown", (e) => {
+          if (e.key !== "Delete" && e.key !== "Backspace") return;
+          // 不干扰文本输入框/多行文本的退格
+          const node = e.target;
+          const tag = (node && node.tagName || "").toLowerCase();
+          if (tag === "input" || tag === "textarea" || (node && node.isContentEditable)) return;
+          const ed = win.svgEditor;
+          if (!ed || !ed.svgCanvas) return;
+          if (ed.selectedElement || ed.multiselected) {
+            e.preventDefault();
+            e.stopPropagation();
+            ed.svgCanvas.deleteSelectedElements();
+          }
+        });
+        deleteKeyAttached = true;
+      } catch (_) { /* 跨域或部分初始化，忽略 */ }
+    }
+
     iframe.addEventListener("load", () => {
       svgReady = true;
-      scheduleSvgEditWireframeOff(iframe.contentWindow);
+      const win = iframe.contentWindow;
+      scheduleSvgEditWireframeOff(win);
+      attachCtrlWheelZoom(win);
+      attachDeleteKey(win);
       const queued = pendingSvgText;
       pendingSvgText = null;
       pendingSvgPriority = 0;
       if (queued) {
-        void tryLoadSvg(queued);
+        void tryLoadSvg(queued).then((ok) => {
+          if (ok) setTimeout(() => fitSvgToView(win), 60);
+        });
+      } else {
+        // iframe 直接通过 ?url= 加载时，SVG-Edit 自己会装入；给一点时间后适配
+        setTimeout(() => fitSvgToView(win), 200);
       }
     });
 
@@ -507,6 +766,11 @@
       if (!artifacts.has(data.path)) {
         artifacts.add(data.path);
         addArtifactCard(artifactList, data);
+      }
+
+      if (data.kind === "figure" && !figureUrl) {
+        figureUrl = data.url;
+        maybeShowConfirmModal();
       }
 
       if (data.kind === "template_svg" || data.kind === "final_svg") {
@@ -537,6 +801,7 @@
         } else {
           statusText.textContent = "Done";
         }
+        maybeShowConfirmModal();
       }
     });
 
@@ -573,8 +838,11 @@
         }
 
         const loaded = await tryLoadSvg(svgText);
-        if (!loaded) {
-          iframe.src = `${svgEditPath}?url=${encodeURIComponent(url)}`;
+        if (loaded) {
+          // SSE 推送新 SVG 后也需适配视图
+          setTimeout(() => fitSvgToView(iframe.contentWindow), 60);
+        } else {
+          iframe.src = `${svgEditPath}?storagePrompt=false&noStorageOnLoad=true&url=${encodeURIComponent(url)}`;
         }
       } else {
         fallbackObject.data = url;
@@ -625,13 +893,33 @@
           setPendingSvg(svgText, 2);
           return;
         }
-        await tryLoadSvg(svgText);
+        const ok = await tryLoadSvg(svgText);
+        if (ok) setTimeout(() => fitSvgToView(iframe.contentWindow), 60);
       } catch (_) {
         /* 磁盘上无 final 或网络错误 — 忽略，由 SSE 后续推送 */
       }
     }
 
     void bootstrapFinalFromDisk();
+
+    /**
+     * Preview mode: check if figure.png already exists on disk (page refresh / SSE miss).
+     */
+    async function bootstrapFigureFromDisk() {
+      if (!previewMode || !jobId) return;
+      const url = `/api/artifacts/${encodeURIComponent(jobId)}/figure.png`;
+      try {
+        const response = await fetch(url, { method: "HEAD" });
+        if (response.ok && !figureUrl) {
+          figureUrl = url;
+          // Assume job is finished if figure.png exists in preview mode
+          isFinished = true;
+          maybeShowConfirmModal();
+        }
+      } catch (_) { /* ignore */ }
+    }
+
+    void bootstrapFigureFromDisk();
   }
 
   function appendLogLine(container, data) {

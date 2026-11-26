@@ -1,7 +1,20 @@
-# Ignore nested git repositories
+# Ignore nested repositories / runtime data
 sam3/
 models/
 AutoFigure-Edit-源代码/
 outputs/
 uploads/
 image-2/
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Local-only UI prefill (may contain API keys)
+web/local-config.js
+
+# Archived dev/test artifacts — kept locally, never published
+_archive/
+
+# Test outputs
+test_svg2pptx.*

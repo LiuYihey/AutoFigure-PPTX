@@ -299,6 +299,42 @@ def call_llm_image_generation(
 # OpenAI-compatible Provider 实现
 # ============================================================================
 
+def _build_openai_client(api_key: str, base_url: str, timeout: float = 600.0):
+    """Build an OpenAI SDK client that bypasses system proxy and uses neutral UA.
+
+    Two issues handled here:
+    1. User-Agent: some third-party gateways (e.g. api.nexai.codes) block
+       requests whose UA contains "OpenAI" (403 "Your request was blocked").
+       The SDK v2.x overrides httpx client's UA at request time, so we use
+       default_headers (merged last by SDK) to force a neutral UA.
+    2. System proxy (VPN): httpx reads HTTP_PROXY/HTTPS_PROXY env vars by
+       default. China-accessible gateways should connect directly; routing
+       through a VPN proxy causes "Server disconnected without sending a
+       response". We set trust_env=False to ignore system proxy settings.
+    """
+    from openai import OpenAI
+    import httpx
+
+    normalized_base_url = base_url.rstrip('/')
+    if not re.search(r'/v\d+$', normalized_base_url):
+        normalized_base_url = f"{normalized_base_url}/v1"
+
+    if isinstance(timeout, httpx.Timeout):
+        http_timeout = timeout
+    else:
+        http_timeout = httpx.Timeout(timeout)
+
+    http_client = httpx.Client(trust_env=False, timeout=http_timeout)
+
+    return OpenAI(
+        api_key=api_key,
+        base_url=normalized_base_url,
+        http_client=http_client,
+        default_headers={"User-Agent": "AutoFigure/1.0"},
+        max_retries=0,
+    )
+
+
 def _call_openai_compatible_text(
     prompt: str,
     api_key: str,
@@ -310,20 +346,8 @@ def _call_openai_compatible_text(
 ) -> Optional[str]:
     """使用 OpenAI SDK 调用兼容接口"""
     try:
-        from openai import OpenAI
-        
-        # 确保 base_url 以版本路径结尾（如 /v1, /v3），但不重复追加
-        normalized_base_url = base_url.rstrip('/')
-        if not re.search(r'/v\d+$', normalized_base_url):
-            normalized_base_url = f"{normalized_base_url}/v1"
-        
-        client = OpenAI(
-            api_key=api_key,
-            base_url=normalized_base_url,
-            timeout=600.0,    # 600 seconds total timeout
-            max_retries=0,     # disable auto retries to avoid repeated charges
-        )
-        
+        client = _build_openai_client(api_key, base_url, timeout=600.0)
+
         completion = client.chat.completions.create(
             model=model,
             messages=[{"role": "user", "content": prompt}],
@@ -359,25 +383,13 @@ def _call_openai_compatible_multimodal(
 ) -> Optional[str]:
     """使用 OpenAI SDK 调用兼容多模态接口"""
     try:
-        from openai import OpenAI
-        
-        # 确保 base_url 以版本路径结尾（如 /v1, /v3），但不重复追加
-        normalized_base_url = base_url.rstrip('/')
-        if not re.search(r'/v\d+$', normalized_base_url):
-            normalized_base_url = f"{normalized_base_url}/v1"
-        
         # DeepSeek 非视觉模型不支持 image_url，需要剥离图片内容
         strip_images = _is_deepseek_non_vision(base_url, model)
         if strip_images:
             print(f"[{provider_label}] 模型 {model} 不支持图片输入，将仅发送文本内容")
-        
-        client = OpenAI(
-            api_key=api_key,
-            base_url=normalized_base_url,
-            timeout=600.0,    # 600 seconds total timeout
-            max_retries=0,     # disable auto retries to avoid repeated charges
-        )
-        
+
+        client = _build_openai_client(api_key, base_url, timeout=600.0)
+
         message_content: List[Dict[str, Any]] = []
         for part in contents:
             if isinstance(part, str):
@@ -417,21 +429,20 @@ def _call_openai_compatible_image_generation(
 ) -> Optional[Image.Image]:
     """使用 OpenAI SDK 调用兼容图像生成接口"""
     try:
-        from openai import OpenAI
-        import re
-        
-        # 确保 base_url 以版本路径结尾（如 /v1, /v3），但不重复追加
+        import httpx
+
+        # 复用统一工厂：禁用系统代理（VPN）+ 覆盖 User-Agent
+        # 生图可能耗时较长，read=None 表示不设读超时
+        client = _build_openai_client(
+            api_key=api_key,
+            base_url=base_url,
+            timeout=httpx.Timeout(connect=30.0, read=None, write=60.0, pool=10.0),
+        )
+
+        # 与 _build_openai_client 保持一致：用于拼接 /images/edits、/images/generations 等端点
         normalized_base_url = base_url.rstrip('/')
         if not re.search(r'/v\d+$', normalized_base_url):
             normalized_base_url = f"{normalized_base_url}/v1"
-            
-        import httpx
-        client = OpenAI(
-            api_key=api_key,
-            base_url=normalized_base_url,
-            timeout=httpx.Timeout(connect=30.0, read=None, write=60.0, pool=10.0),  # read=None: no read timeout for slow image generation
-            max_retries=0,     # disable auto retries to avoid repeated charges
-        )
 
         if "gemini" in model.lower() and "preview" in model.lower():
             print(f"[{provider_label}] 检测到 {model} 模型，使用 Chat 模式调用图像生成 API")
@@ -482,12 +493,14 @@ def _call_openai_compatible_image_generation(
             ref_png_bytes = buf.getvalue()
 
             headers = {"Authorization": f"Bearer {api_key}"}
+            # gpt-image-* 系列模型不支持 response_format 参数（恒返回 b64_json），不传该参数。
             form_data = {
                 "model": model,
                 "prompt": prompt,
                 "n": "1",
-                "response_format": "b64_json",
             }
+            if "gpt-image" not in model.lower():
+                form_data["response_format"] = "b64_json"
 
             last_err: Optional[str] = None
             # 一些中转网关要求 multipart 字段名为 image[]，另一些要求重复的 image；
@@ -510,11 +523,18 @@ def _call_openai_compatible_image_generation(
                 if resp.status_code == 200:
                     data_json = resp.json()
                     items = data_json.get("data") or []
-                    if items and items[0].get("b64_json"):
-                        img_data = base64.b64decode(items[0]["b64_json"])
-                        return Image.open(io.BytesIO(img_data)).convert("RGB")
+                    if items:
+                        item = items[0]
+                        if item.get("b64_json"):
+                            img_data = base64.b64decode(item["b64_json"])
+                            return Image.open(io.BytesIO(img_data)).convert("RGB")
+                        if item.get("url"):
+                            print(f"[{provider_label}] /images/edits 返回图片 URL: {item['url'][:120]}")
+                            img_resp = requests.get(item["url"], timeout=300)
+                            img_resp.raise_for_status()
+                            return Image.open(io.BytesIO(img_resp.content)).convert("RGB")
                     last_err = f"HTTP 200 but empty data: {data_json}"
-                    print(f"[{provider_label}] /images/edits 返回 200 但无 b64_json")
+                    print(f"[{provider_label}] /images/edits 返回 200 但无 b64_json/url")
                     break
 
                 last_err = f"HTTP {resp.status_code} {resp.text[:500]}"
@@ -530,18 +550,34 @@ def _call_openai_compatible_image_generation(
 
         print(f"[{provider_label}] 调用图像生成 API: {normalized_base_url}/images/generations")
 
-        response = client.images.generate(
-            model=model,
-            prompt=prompt,
-            n=1,
-            response_format="b64_json"
-        )
-        
-        # 处理响应
+        # gpt-image-* 系列模型（如 gpt-image-1 / gpt-image-2）：OpenAI 官方接口本身
+        # 就不支持 response_format 参数（模型恒返回 b64_json），中转网关（如
+        # api.bianxie.ai）会直接以 400 Unknown parameter 拒绝。因此这类模型不传该参数。
+        # 其余模型（如 dall-e-*，默认返回 url）才显式指定 b64_json。
+        kwargs = {
+            "model": model,
+            "prompt": prompt,
+            "n": 1,
+        }
+        if "gpt-image" not in model.lower():
+            kwargs["response_format"] = "b64_json"
+
+        response = client.images.generate(**kwargs)
+
+        # 处理响应：gpt-image-* 恒返回 b64_json；部分网关也可能返回 url，这里两种都兼容。
         if hasattr(response, 'data') and response.data:
-            b64_data = response.data[0].b64_json
-            img_data = base64.b64decode(b64_data)
-            return Image.open(io.BytesIO(img_data)).convert("RGB")
+            item = response.data[0]
+            if getattr(item, "b64_json", None):
+                img_data = base64.b64decode(item.b64_json)
+                return Image.open(io.BytesIO(img_data)).convert("RGB")
+            url = getattr(item, "url", None)
+            if url:
+                print(f"[{provider_label}] 接口返回图片 URL: {url[:120]}")
+                img_resp = requests.get(url, timeout=300)
+                img_resp.raise_for_status()
+                return Image.open(io.BytesIO(img_resp.content)).convert("RGB")
+            print(f"[{provider_label}] 生图失败，未返回图像数据")
+            return None
         else:
             print(f"[{provider_label}] 生图失败，未返回图像数据")
             return None

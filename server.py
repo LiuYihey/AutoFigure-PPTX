@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import queue
+import shutil
 import socket
 import subprocess
 import threading
@@ -128,6 +129,7 @@ class RunRequest(BaseModel):
     reference_image_path: Optional[str] = None
     input_image_path: Optional[str] = None
     resume_dir: Optional[str] = None
+    stop_after: Optional[int] = None
 
 
 app = FastAPI()
@@ -234,6 +236,9 @@ def run_job(req: RunRequest) -> JSONResponse:
         if not Path(resume_path).is_absolute():
             resume_path = str((OUTPUTS_DIR / resume_path).resolve())
         cmd += ["--resume_dir", resume_path]
+
+    if req.stop_after is not None:
+        cmd += ["--stop_after", str(req.stop_after)]
 
     env = os.environ.copy()
     env["PYTHONUNBUFFERED"] = "1"
@@ -367,165 +372,143 @@ async def save_svg(job_id: str, req: SaveSvgRequest) -> JSONResponse:
 
 class ExportPptxRequest(BaseModel):
     svg: str
-    width_cm: float = 33.87
-    height_cm: float = 19.05
+
+
+# ── Native (DrawingML) PPTX export via svg2ooxml ──────────────────────────────
+# svg2ooxml requires Python >= 3.13 (PEP 695 type statements). The main figure
+# conda env is Python 3.10, so we spawn a dedicated Python 3.13 interpreter
+# that has svg2ooxml installed and pipe the SVG string in via stdin.
+_PY313_CANDIDATES = [
+    r"C:\Python313\python.exe",
+    r"C:\Python3.13\python.exe",
+    os.path.expandvars(r"%LOCALAPPDATA%\Programs\Python\Python313\python.exe"),
+]
+
+
+def _find_python313() -> str | None:
+    """Return the first existing Python 3.13 interpreter path, or None."""
+    # Allow override via env var
+    explicit = os.environ.get("AUTOFIGURE_PY313")
+    if explicit and Path(explicit).is_file():
+        return explicit
+    for cand in _PY313_CANDIDATES:
+        if Path(cand).is_file():
+            return cand
+    # Last resort: check PATH for a python that reports version 3.13
+    for exe_name in ("python3.13", "python"):
+        found = shutil.which(exe_name)
+        if not found:
+            continue
+        try:
+            out = subprocess.check_output(
+                [found, "-c", "import sys; print(sys.version_info[:2])"],
+                stderr=subprocess.DEVNULL,
+                text=True,
+                timeout=5,
+            ).strip()
+            if out.startswith("(3, 13)"):
+                return found
+        except Exception:
+            continue
+    return None
 
 
 @app.post("/api/export-pptx/{job_id}")
 async def export_pptx(job_id: str, req: ExportPptxRequest) -> Response:
-    """Export SVG as a PPTX with the SVG embedded as a native Office SVG image.
+    """Export SVG to PPTX as native DrawingML shapes & text via svg2ooxml.
 
-    Office 2016+ (and LibreOffice 6+) natively renders SVG images placed via the
-    OOXML SVG extension (<asvg:svgBlip>).  The shape stays fully vector and every
-    text / path element is editable inside PowerPoint without any rasterisation.
+    Every ``<rect>``/``<text>``/``<path>`` in the SVG becomes a first-class
+    ``<p:sp>`` shape with ``<a:prstGeom>`` and ``<p:txBody>``.  Text remains
+    directly editable (font, size, content) and shape geometry / colors /
+    positions are preserved at EMU precision — no "Convert to Shapes" step
+    needed in PowerPoint.
 
-    How it works:
-      1. Build a minimal PPTX in-memory with python-pptx.
-      2. Add a 1×1 px placeholder PNG (required by OOXML – the blipFill must have a
-         fallback raster Part even when an SVG extension is present).
-      3. Inject the SVG bytes as a new Part into the zip and attach it to the shape
-         via the <asvg:svgBlip r:embed="…"/> extension element.
-    The resulting file opens in PPT as a fully editable SVG image.
+    Implementation: spawn ``svg2pptx_bridge.py`` under Python 3.13, feed the
+    SVG via stdin, write the PPTX to a temp file, then stream it back.
     """
+    if not req.svg or not req.svg.strip():
+        raise HTTPException(status_code=400, detail="SVG content is required")
+
     job = JOBS.get(job_id)
-    if not job:
-        # Allow export even when job is no longer in memory (server restart / completed)
+    if job:
+        output_dir = job.output_dir
+    else:
         output_dir = OUTPUTS_DIR / job_id
         if not output_dir.is_dir():
             raise HTTPException(status_code=404, detail="Job not found")
 
-    try:
-        import io as _io
-        import zipfile as _zipfile
-        from xml.etree import ElementTree as ET
-
-        from pptx import Presentation
-        from pptx.util import Cm
-        from lxml import etree as _etree
-
-        NS_A    = "http://schemas.openxmlformats.org/drawingml/2006/main"
-        NS_ASVG = "http://schemas.microsoft.com/office/drawing/2016/SVG/main"
-        NS_R    = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
-        NS_REL  = "http://schemas.openxmlformats.org/package/2006/relationships"
-        NS_CT   = "http://schemas.openxmlformats.org/package/2006/content-types"
-        SVG_IMG_TYPE = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/image"
-
-        # ── 1. Parse SVG dimensions ──────────────────────────────────────────
-        svg_bytes = req.svg.encode("utf-8")
-        try:
-            root = ET.fromstring(svg_bytes)
-            raw_w = root.get("width", "") or ""
-            raw_h = root.get("height", "") or ""
-            svg_w = float(raw_w.replace("px", "").strip()) if raw_w.replace("px", "").strip() else None
-            svg_h = float(raw_h.replace("px", "").strip()) if raw_h.replace("px", "").strip() else None
-            if svg_w is None or svg_h is None:
-                vb = root.get("viewBox", "")
-                parts = vb.split()
-                if len(parts) == 4:
-                    svg_w = float(parts[2])
-                    svg_h = float(parts[3])
-                else:
-                    svg_w, svg_h = 1200.0, 800.0
-        except Exception:
-            svg_w, svg_h = 1200.0, 800.0
-
-        # ── 2. Build PPTX with 1×1 transparent PNG as raster fallback ────────
-        prs = Presentation()
-        prs.slide_width = Cm(req.width_cm)
-        prs.slide_height = Cm(req.height_cm)
-        slide = prs.slides.add_slide(prs.slide_layouts[6])
-        slide_w_emu = int(prs.slide_width)
-        slide_h_emu = int(prs.slide_height)
-
-        TRANSPARENT_1PX_PNG = (
-            b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00"
-            b"\x01\x08\x06\x00\x00\x00\x1f\x15\xc4\x89\x00\x00\x00\nIDATx\x9cc"
-            b"\x00\x01\x00\x00\x05\x00\x01\r\n-\xb4\x00\x00\x00\x00IEND\xaeB`\x82"
-        )
-        slide.shapes.add_picture(_io.BytesIO(TRANSPARENT_1PX_PNG), 0, 0, slide_w_emu, slide_h_emu)
-
-        buf = _io.BytesIO()
-        prs.save(buf)
-        buf.seek(0)
-
-        # ── 3. Zip-level injection of SVG part + relationship + svgBlip ───────
-        SLIDE_XML  = "ppt/slides/slide1.xml"
-        SLIDE_RELS = "ppt/slides/_rels/slide1.xml.rels"
-        SVG_PART   = "ppt/media/image_svg1.svg"
-        SVG_RID    = "rIdSVG1"
-        rid = SVG_RID  # pre-initialize before zip loop
-
-        out_buf = _io.BytesIO()
-        with _zipfile.ZipFile(buf, "r") as zin, \
-             _zipfile.ZipFile(out_buf, "w", _zipfile.ZIP_DEFLATED) as zout:
-
-            for item in zin.infolist():
-                data = zin.read(item.filename)
-
-                # ── patch slide rels: add SVG relationship ──────────────────
-                if item.filename == SLIDE_RELS:
-                    rels_tree = _etree.fromstring(data)
-                    # avoid duplicate
-                    existing_ids = {el.get("Id") for el in rels_tree}
-                    rid = SVG_RID
-                    n = 1
-                    while rid in existing_ids:
-                        n += 1
-                        rid = f"rIdSVG{n}"
-                    rel_el = _etree.SubElement(rels_tree, f"{{{NS_REL}}}Relationship")
-                    rel_el.set("Id", rid)
-                    rel_el.set("Type", SVG_IMG_TYPE)
-                    rel_el.set("Target", "../media/image_svg1.svg")
-                    data = _etree.tostring(rels_tree, xml_declaration=True,
-                                           encoding="UTF-8", standalone=True)
-
-                # ── patch slide XML: inject <asvg:svgBlip> into <a:blip> ────
-                elif item.filename == SLIDE_XML:
-                    slide_tree = _etree.fromstring(data)
-                    # The blip is always <a:blip> regardless of parent namespace
-                    for blip_el in slide_tree.iter(f"{{{NS_A}}}blip"):
-                        ext_lst = blip_el.find(f"{{{NS_A}}}extLst")
-                        if ext_lst is None:
-                            ext_lst = _etree.SubElement(blip_el, f"{{{NS_A}}}extLst")
-                        ext = _etree.SubElement(ext_lst, f"{{{NS_A}}}ext")
-                        ext.set("uri", "{96DAC541-7B7A-43D3-8B79-37D633B846F1}")
-                        svg_blip = _etree.SubElement(ext, f"{{{NS_ASVG}}}svgBlip")
-                        svg_blip.set(f"{{{NS_R}}}embed", rid)
-                        break  # only first picture
-                    data = _etree.tostring(slide_tree, xml_declaration=True,
-                                           encoding="UTF-8", standalone=True)
-
-                # ── patch content types: register .svg if missing ───────────
-                elif item.filename == "[Content_Types].xml":
-                    ct_tree = _etree.fromstring(data)
-                    if not any(el.get("Extension") == "svg"
-                               for el in ct_tree.findall(f"{{{NS_CT}}}Default")):
-                        d = _etree.SubElement(ct_tree, f"{{{NS_CT}}}Default")
-                        d.set("Extension", "svg")
-                        d.set("ContentType", "image/svg+xml")
-                    data = _etree.tostring(ct_tree, xml_declaration=True,
-                                           encoding="UTF-8", standalone=True)
-
-                zout.writestr(item, data)
-
-            # write the SVG part itself
-            zout.writestr(SVG_PART, svg_bytes)
-
-        out_buf.seek(0)
-        filename = f"figure_{job_id}.pptx"
-        return Response(
-            content=out_buf.read(),
-            media_type="application/vnd.openxmlformats-officedocument.presentationml.presentation",
-            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
-        )
-    except ImportError as exc:
+    py313 = _find_python313()
+    if not py313:
         raise HTTPException(
             status_code=500,
-            detail=f"python-pptx not installed. Run: pip install python-pptx lxml. ({exc})",
+            detail=(
+                "Python 3.13 not found. svg2ooxml requires Python >= 3.13. "
+                "Install Python 3.13 and svg2ooxml (pip install svg2ooxml), "
+                "or set AUTOFIGURE_PY313 env var to the python.exe path."
+            ),
         )
-    except Exception as exc:
-        import traceback as _tb
-        raise HTTPException(status_code=500, detail=f"PPTX export error: {exc}\n{_tb.format_exc()}")
+
+    bridge = BASE_DIR / "svg2pptx_bridge.py"
+    if not bridge.is_file():
+        raise HTTPException(status_code=500, detail=f"Bridge script missing: {bridge}")
+
+    # Use a temp output path inside the job dir to avoid clashing with the
+    # embedded-SVG export. Cleaned up after reading.
+    out_path = output_dir / f"native_{uuid.uuid4().hex}.pptx"
+
+    try:
+        # 子进程 stdin/stdout 必须显式用 UTF-8：Windows 默认 GBK，
+        # SVG 中的特殊符号（如 ⋮ U+22EE）会导致 stdin.write 抛 UnicodeEncodeError。
+        bridge_env = os.environ.copy()
+        bridge_env["PYTHONUTF8"] = "1"
+        proc = subprocess.run(
+            [py313, str(bridge), str(out_path)],
+            input=req.svg,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            capture_output=True,
+            timeout=120,
+            cwd=str(BASE_DIR),
+            env=bridge_env,
+        )
+    except subprocess.TimeoutExpired:
+        if out_path.exists():
+            try:
+                out_path.unlink()
+            except OSError:
+                pass
+        raise HTTPException(status_code=504, detail="svg2ooxml conversion timed out (>120s)")
+
+    if proc.returncode != 0:
+        if out_path.exists():
+            try:
+                out_path.unlink()
+            except OSError:
+                pass
+        detail = proc.stderr.strip() or proc.stdout.strip() or f"exit code {proc.returncode}"
+        raise HTTPException(
+            status_code=500,
+            detail=f"svg2ooxml conversion failed (Python 3.13): {detail}",
+        )
+
+    if not out_path.is_file():
+        raise HTTPException(status_code=500, detail="svg2ooxml produced no output file")
+
+    try:
+        pptx_bytes = out_path.read_bytes()
+    finally:
+        try:
+            out_path.unlink()
+        except OSError:
+            pass
+
+    filename = f"figure_{job_id}_native.pptx"
+    return Response(
+        content=pptx_bytes,
+        media_type="application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 
 @app.get("/api/uploads/{filename}")
@@ -643,6 +626,19 @@ def _classify_artifact(rel_path: str) -> str:
     return "artifact"
 
 
+@app.get("/local-config.js")
+def local_config_js() -> Response:
+    """Serve optional local-only UI prefill.
+
+    ``web/local-config.js`` is git-ignored so personal API keys / endpoints
+    stay on this machine; the public repo ships an empty shell.
+    """
+    candidate = WEB_DIR / "local-config.js"
+    if candidate.is_file():
+        return FileResponse(candidate, media_type="application/javascript")
+    return Response("// no local overrides\n", media_type="application/javascript")
+
+
 app.mount("/", StaticFiles(directory=WEB_DIR, html=True), name="static")
 
 
@@ -677,6 +673,13 @@ if __name__ == "__main__":
     def start_server_with_fallback() -> int:
         # Allow overriding the initial port from environment for flexibility in Docker/PM2/etc.
         initial_port = int(os.environ.get("AUTOFIGURE_PORT", 8000))
+        # Host can be overridden via env var. Default 0.0.0.0 keeps backward
+        # compatibility for Docker/LAN deployments; launch.py sets 127.0.0.1 for
+        # single-user desktop usage so the server only listens on localhost.
+        host = os.environ.get("AUTOFIGURE_HOST", "0.0.0.0")
+        # The address shown to the user in the browser: 127.0.0.1 for localhost,
+        # otherwise the configured host (e.g. for LAN deployments).
+        display_host = "127.0.0.1" if host in ("0.0.0.0", "::") else host
 
         try:
             actual_port = find_available_port(initial_port)
@@ -687,12 +690,12 @@ if __name__ == "__main__":
         for attempt in range(3):
             try:
                 print("--- Starting Server ---")
-                print(f"Local access: http://127.0.0.1:{actual_port}")
+                print(f"Local access: http://{display_host}:{actual_port}")
                 print("-----------------------")
 
                 uvicorn.run(
                     "server:app",
-                    host="0.0.0.0",
+                    host=host,
                     port=actual_port,
                     reload=False,
                     access_log=False,

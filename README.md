@@ -1,295 +1,119 @@
 <div align="center">
 
-<img src="img/logo.png" alt="AutoFigure-edit Logo" width="100%"/>
+<img src="autofigure_icon.svg" width="88" alt="AutoFigure-Edit icon" />
 
-# AutoFigure: Generating and Refining Publication-Ready Scientific Illustrations [ICLR 2026]
+# AutoFigure-Edit · Windows
 
-<p align="center">
-  <a href="README.md">English</a> | <a href="README_ZH.md">中文</a>
-</p>
+**把论文里的方法段落，变成可编辑的矢量插图。**
 
-[![ICLR 2026](https://img.shields.io/badge/ICLR-2026-blue?style=for-the-badge&logo=openreview)](https://openreview.net/forum?id=5N3z9JQJKq)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg?style=for-the-badge)](https://opensource.org/licenses/MIT)
-[![Python](https://img.shields.io/badge/Python-3.10%2B-blue?style=for-the-badge&logo=python&logoColor=white)](https://www.python.org/)
-[![HuggingFace](https://img.shields.io/badge/%F0%9F%A4%97%20HuggingFace-FigureBench-orange?style=for-the-badge)](https://huggingface.co/datasets/WestlakeNLP/FigureBench)
+Windows 一键启动版 · 基于 [ResearAI/AutoFigure-Edit](https://github.com/ResearAI/AutoFigure-Edit)
 
-<p align="center">
-  <strong>From Method Text to Editable SVG</strong><br>
-  AutoFigure-edit is the next version of AutoFigure. It turns paper method sections into fully editable SVG figures and lets you refine them in an embedded SVG editor.
-</p>
-
-[Quick Start](#-quick-start) • [Web Interface](#-web-interface) • [How It Works](#-how-it-works) • [Configuration](#-configuration) • [Citation](#-citation--license)
-
-[[`Paper`](https://openreview.net/forum?id=5N3z9JQJKq)]
-[[`Project`](https://github.com/ResearAI/AutoFigure)]
-[[`BibTeX`](#-citation--license)]
+![Windows](https://img.shields.io/badge/Windows-10%2F11-0e1116?style=flat-square)
+![Python](https://img.shields.io/badge/Python-3.10%2B-0e1116?style=flat-square)
+![License](https://img.shields.io/badge/License-MIT-5ee4d4?style=flat-square)
 
 </div>
 
----
+![AutoFigure-Edit 前端界面](img/screenshot.png)
 
-## 🔥 News
+## 简介
 
-- **[2026.03.11]** 📄 Our **AutoFigure-Edit** paper is now available on [arXiv](https://arxiv.org/pdf/2603.06674) and featured in 🤗[Hugging Face Daily Papers](https://huggingface.co/papers/2603.06674)! If you find our work helpful, please consider giving us an **upvote** on Hugging Face and **citing** our paper. Thank you! ❤️
-- **[2026.02.17]** 🚀 The **AutoFigure-Edit online platform** is now live! It is free for all scholars to use. Try it out at [deepscientist.cc](https://deepscientist.cc).
-- **[2026.01.26]** 🎉 AutoFigure has been accepted to **ICLR 2026**! You can read the paper on [arXiv](https://arxiv.org/abs/2602.03828).
+AutoFigure-Edit 将 Method Text 依次经过生图、SAM3 图标检测、图标去背、多模态 SVG 重建与图标注入，最终得到一份**纯代码、可深度编辑的 SVG**。生成结果可以直接在内嵌的 SVG 编辑器中修改，也可以导出为 PowerPoint 原生的可编辑形状。
 
----
+这个仓库是面向 Windows 的启动与整理版本：双击 `start.bat` 即可打开界面，并附带独立的启动器、应用图标与原生 PPTX 导出桥接。
 
-## ✨ Features
+## 特性
 
-| Feature | Description |
-| :--- | :--- |
-| 📝 **Text-to-Figure** | Generate a draft figure directly from method text. |
-| 🧠 **SAM3 Icon Detection** | Detect icon regions from multiple prompts and merge overlaps. |
-| 🎯 **Labeled Placeholders** | Insert consistent AF-style placeholders for reliable SVG mapping. |
-| 🧩 **SVG Generation** | Produce an editable SVG template aligned to the figure. |
-| 🖥️ **Embedded Editor** | Edit the SVG in-browser using the bundled svg-edit. |
-| 📦 **Artifact Outputs** | Save PNG/SVG outputs and icon crops per run. |
+- **Text to Figure**：从方法段落生成论文插图底图。
+- **SAM3 图标检测**：支持本地 SAM3，也支持 fal / Roboflow API。
+- **可编辑 SVG**：输出由 `<rect>`、`<path>`、`<text>` 组成的矢量模板，文字与形状均可编辑。
+- **内嵌编辑器**：基于 svg-edit，在浏览器里直接改图。
+- **风格参考图**：上传参考图片，让生成结果贴近目标风格。
+- **原生 PPTX 导出**：通过 svg2ooxml 输出 DrawingML 形状与文本框，可在 PowerPoint 中继续编辑。
+- **一键启动**：`start.bat` 自动寻找 Python 环境并打开浏览器。
 
----
+## 快速开始
 
-## 🎨 Gallery: Editable Vectorization & Style Transfer
-
-AutoFigure-edit introduces two breakthrough capabilities:
-
-1.  **Fully Editable SVGs (Pure Code Implementation):** Unlike raster images, our outputs are structured Vector Graphics (SVG). Every component is editable—text, shapes, and layout can be modified losslessly.
-2.  **Style Transfer:** The system can mimic the artistic style of reference images provided by the user.
-
-Below are **9 examples** covering 3 different papers. Each paper is generated using 3 different reference styles.
-*(Each image shows: **Left** = AutoFigure Generation | **Right** = Vectorized Editable SVG)*
-
-| Paper & Style Transfer Demonstration |
-| :---: |
-| **[CycleResearcher](https://github.com/zhu-minjun/Researcher) / [Style 1](https://arxiv.org/pdf/2510.09558)**<br><img src="img/case/4.png" width="100%" alt="Paper 1 Style 1"/> |
-| **[CycleResearcher](https://github.com/zhu-minjun/Researcher) / [Style 2](https://arxiv.org/pdf/2503.18102)**<br><img src="img/case/5.png" width="100%" alt="Paper 1 Style 2"/> |
-| **[CycleResearcher](https://github.com/zhu-minjun/Researcher) / [Style 3](https://arxiv.org/pdf/2510.14512)**<br><img src="img/case/6.png" width="100%" alt="Paper 1 Style 3"/> |
-| **[DeepReviewer](https://github.com/zhu-minjun/Researcher) / [Style 1](https://arxiv.org/pdf/2510.09558)**<br><img src="img/case/7.png" width="100%" alt="Paper 2 Style 1"/> |
-| **[DeepReviewer](https://github.com/zhu-minjun/Researcher) / [Style 2](https://arxiv.org/pdf/2503.18102)**<br><img src="img/case/8.png" width="100%" alt="Paper 2 Style 2"/> |
-| **[DeepReviewer](https://github.com/zhu-minjun/Researcher) / [Style 3](https://arxiv.org/pdf/2510.14512)**<br><img src="img/case/9.png" width="100%" alt="Paper 2 Style 3"/> |
-| **[DeepScientist](https://github.com/ResearAI/DeepScientist) / [Style 1](https://arxiv.org/pdf/2510.09558)**<br><img src="img/case/10.png" width="100%" alt="Paper 3 Style 1"/> |
-| **[DeepScientist](https://github.com/ResearAI/DeepScientist) / [Style 2](https://arxiv.org/pdf/2503.18102)**<br><img src="img/case/11.png" width="100%" alt="Paper 3 Style 2"/> |
-| **[DeepScientist](https://github.com/ResearAI/DeepScientist) / [Style 3](https://arxiv.org/pdf/2510.14512)**<br><img src="img/case/12.png" width="100%" alt="Paper 3 Style 3"/> |
-
----
-## 🚀 How It Works
-
-The AutoFigure-edit pipeline transforms a raw generation into an editable SVG in four distinct stages:
-
-<div align="center">
-  <img src="img/pipeline.png" width="100%" alt="Pipeline Visualization: Figure -> SAM -> Template -> Final"/>
-  <br>
-  <em>(1) Raw Generation &rarr; (2) SAM3 Segmentation &rarr; (3) SVG Layout Template &rarr; (4) Final Assembled Vector</em>
-</div>
-
-<br>
-
-1.  **Generation (`figure.png`):** The LLM generates a raster draft based on the method text.
-2.  **Segmentation (`sam.png`):** SAM3 detects and segments distinct icons and text regions.
-3.  **Templating (`template.svg`):** The system constructs a structural SVG wireframe using placeholders.
-4.  **Assembly (`final.svg`):** High-quality cropped icons and vectorized text are injected into the template.
-
-<details>
-<summary><strong>View Detailed Technical Pipeline</strong></summary>
-
-<br>
-<div align="center">
-  <img src="img/edit_method.png" width="100%" alt="AutoFigure-edit Technical Pipeline"/>
-</div>
-
-AutoFigure2’s pipeline starts from the paper’s method text and first calls a **text‑to‑image LLM** to render a journal‑style schematic, saved as `figure.png`. The system then runs **SAM3 segmentation** on that image using one or more text prompts (e.g., “icon, diagram, arrow”), merges overlapping detections by an IoU‑like threshold, and draws gray‑filled, black‑outlined labeled boxes on the original; this produces both `samed.png` (the labeled mask overlay) and a structured `boxlib.json` with coordinates, scores, and prompt sources.
-
-Next, each box is cropped from the original figure and passed through **RMBG‑2.0** for background removal, yielding transparent icon assets under `icons/*.png` and `*_nobg.png`. With `figure.png`, `samed.png`, and `boxlib.json` as multimodal inputs, the LLM generates a **placeholder‑style SVG** (`template.svg`) whose boxes match the labeled regions.
-
-Optionally, the SVG is iteratively refined by an **LLM optimizer** to better align strokes, layouts, and styles, resulting in `optimized_template.svg` (or the original template if optimization is skipped). The system then compares the SVG dimensions with the original figure to compute scale factors and aligns coordinate systems. Finally, it replaces each placeholder in the SVG with the corresponding transparent icon (matched by label/ID), producing the assembled `final.svg`.
-
-**Key configuration details:**
-- **Placeholder Mode:** Controls how icon boxes are encoded in the prompt (`label`, `box`, or `none`).
-- **Optimization:** `optimize_iterations=0` allows skipping the refinement step to use the raw structure directly.
-</details>
-
----
-
-## ⚡ Quick Start
-
-### Option 1: CLI
+### 1. 准备环境
 
 ```bash
-# 1) Install dependencies
+conda create -n figure python=3.10 -y
+conda activate figure
 pip install -r requirements.txt
-
-# 2) Install SAM3 separately (not vendored in this repo)
-git clone https://github.com/facebookresearch/sam3.git
-cd sam3
-pip install -e .
 ```
 
-**Run:**
+> 启动器会优先寻找名为 `figure` 的 conda 环境，也可以通过环境变量 `AUTOFIGURE_PYTHON` 指定解释器。
+
+### 2. 启动
+
+直接双击 `start.bat`，或手动运行：
 
 ```bash
-python autofigure2.py \
-  --method_file paper.txt \
-  --output_dir outputs/demo \
-  --provider bianxie \
-  --api_key YOUR_KEY
+python launch.py
 ```
 
-### Option 2: Web Interface
+启动器会打印本地访问地址并自动打开浏览器。
+
+### 3. 本地模型
+
+SAM3 与 RMBG 的权重不随仓库分发。将模型放到 `models/`（或按 `download_models.py` / 上游文档配置），本地模式即可使用。
+
+## 默认模型
+
+| 链路 | 默认模型 |
+| :--- | :--- |
+| 生图 API | `gpt-image-2.6-sunburst` |
+| 多模态 / SVG | `claude-sonnet-5-5` |
+
+两者都可以在界面右侧的 **1. Image Generation** 与 **2. SVG & Multimodal** 中修改。Provider、Base URL、API Key 均按你的网关填写。
+
+## 原生 PPTX 导出
+
+原生导出依赖 **Python 3.13 + svg2ooxml**（主环境通常使用 Python 3.10，所以由独立解释器完成转换）：
 
 ```bash
-python server.py
+pip install svg2ooxml
 ```
 
-Then open `http://localhost:8000`.
+如果 Python 3.13 不在默认安装位置，设置 `AUTOFIGURE_PY313` 指向对应的 `python.exe`。
 
----
+## 关于 API Key
 
-## 🖥️ Web Interface Demo
+仓库不包含任何密钥或私有端点。界面中的 Provider / Base URL / API Key 默认留空，请在本地填写。
 
-AutoFigure-edit provides a visual web interface designed for seamless generation and editing.
+如果希望本机每次打开都自动预填，可创建 **不会被 git 跟踪** 的 `web/local-config.js`：
 
-### 1. Configuration Page
-<img src="img/demo_start.png" width="100%" alt="Configuration Page" style="border: 1px solid #ddd; border-radius: 8px; margin-bottom: 10px;"/>
-
-On the start page, paste your paper's method text on the left. On the right, configure your generation settings:
-*   **Provider:** Select your LLM provider (OpenRouter, Bianxie, or Gemini).
-*   **Optimize:** Set SVG template refinement iterations (recommend `0` for standard use).
-*   **Reference Image:** Upload a target image to enable style transfer.
-*   **SAM3 Backend:** Choose local SAM3 or the fal.ai API (API key optional).
-
-### 2. Canvas & Editor
-<img src="img/demo_canvas.png" width="100%" alt="Canvas Page" style="border: 1px solid #ddd; border-radius: 8px; margin-bottom: 10px;"/>
-
-The generation result loads directly into an integrated [SVG-Edit](https://github.com/SVG-Edit/svgedit) canvas, allowing for full vector editing.
-*   **Status & Logs:** Check real-time progress (top-left) and view detailed execution logs (top-right button).
-*   **Artifacts Drawer:** Click the floating button (bottom-right) to expand the **Artifacts Panel**. This contains all intermediate outputs (icons, SVG templates, etc.). You can **drag and drop** any artifact directly onto the canvas for custom composition.
-
----
-
-## 🧩 SAM3 Installation Notes
-
-AutoFigure-edit depends on SAM3 but does **not** vendor it. Please follow the
-official SAM3 installation guide and prerequisites. The upstream repo currently
-targets Python 3.12+, PyTorch 2.7+, and CUDA 12.6 for GPU builds.
-
-SAM3 checkpoints are hosted on Hugging Face and may require you to request
-access and authenticate (e.g., `huggingface-cli login`) before download.
-
-- SAM3 repo: https://github.com/facebookresearch/sam3
-- SAM3 Hugging Face: https://huggingface.co/facebook/sam3
-
-### SAM3 API Mode (No Local Install)
-
-If you prefer not to install SAM3 locally, you can use an API backend (also supported in the Web demo). **We recommend using [Roboflow](https://roboflow.com/) as it is free to use.**
-
-**Option A: fal.ai**
-
-```bash
-export FAL_KEY="your-fal-key"
-python autofigure2.py \
-  --method_file paper.txt \
-  --output_dir outputs/demo \
-  --provider bianxie \
-  --api_key YOUR_KEY \
-  --sam_backend fal
+```js
+(() => {
+  const set = (id, value) => {
+    const el = document.getElementById(id);
+    if (el) el.value = value;
+  };
+  set("imageProvider", "custom");
+  set("imageBaseUrl", "https://your-endpoint");
+  set("imageApiKey", "sk-...");
+  set("imageModel", "gpt-image-2.6-sunburst");
+})();
 ```
 
-**Option B: Roboflow**
+该文件已加入 `.gitignore`，提交前无需再做额外处理。
 
-```bash
-export ROBOFLOW_API_KEY="your-roboflow-key"
-python autofigure2.py \
-  --method_file paper.txt \
-  --output_dir outputs/demo \
-  --provider bianxie \
-  --api_key YOUR_KEY \
-  --sam_backend roboflow
+## 目录结构
+
+```text
+AutoFigure-Edit/
+├─ start.bat              # Windows 一键启动
+├─ launch.py              # 启动器：找环境、起服务、开浏览器
+├─ server.py              # FastAPI 服务与 PPTX 导出接口
+├─ autofigure2.py         # 生成流水线（生图 / SAM3 / SVG）
+├─ svg2pptx_bridge.py     # Python 3.13 原生 PPTX 转换桥
+├─ pptx_text_merger.py    # PPTX 文本合并后处理
+├─ svg_marker_expander.py # SVG marker 展开
+├─ web/                   # 前端页面与内嵌编辑器
+├─ models/                # 本地模型（不随仓库分发）
+└─ outputs/               # 每次任务的输出
 ```
 
-Optional CLI flags (API):
-- `--sam_api_key` (overrides `FAL_KEY`/`ROBOFLOW_API_KEY`)
-- `--sam_max_masks` (default: 32, fal.ai only)
+## 来源与许可
 
-## ⚙️ Configuration
-
-### Supported LLM Providers
-
-| Provider | Base URL | Notes |
-|----------|----------|------|
-| **OpenRouter** | `openrouter.ai/api/v1` | Supports Gemini/Claude/others |
-| **Bianxie** | `api.bianxie.ai/v1` | OpenAI-compatible API |
-| **Gemini (Google)** | `generativelanguage.googleapis.com/v1beta` | Official Google Gemini API (`google-genai`) |
-
-Common CLI flags:
-
-- `--provider` (openrouter | bianxie | gemini)
-- `--image_model`, `--svg_model`
-- `--sam_prompt` (comma-separated prompts)
-- `--sam_backend` (local | fal | roboflow | api)
-- `--sam_api_key` (API key override; falls back to `FAL_KEY` or `ROBOFLOW_API_KEY`)
-- `--sam_max_masks` (fal.ai max masks, default 32)
-- `--merge_threshold` (0 disables merging)
-- `--optimize_iterations` (0 disables optimization)
-- `--reference_image_path` (optional)
-
----
-
-## 📁 Project Structure
-
-<details>
-<summary>Click to expand directory tree</summary>
-
-```
-AutoFigure-edit/
-├── autofigure2.py         # Main pipeline
-├── server.py              # FastAPI backend
-├── requirements.txt
-├── web/                   # Static frontend
-│   ├── index.html
-│   ├── canvas.html
-│   ├── styles.css
-│   ├── app.js
-│   └── vendor/svg-edit/   # Embedded SVG editor
-└── img/                   # README assets
-```
-</details>
-
----
-
-## 🤝 Community & Support
-
-**WeChat Discussion Group**  
-Scan the QR code to join our community. If the code is expired, please add WeChat ID `nauhcutnil` or contact `tuchuan@mail.hfut.edu.cn`.
-
-<table>
-  <tr>
-    <td><img src="img/wechat5.jpg" width="200" alt="WeChat 2"/></td>
-  </tr>
-</table>
-
----
-
-## 📜 Citation & License
-
-If you find **AutoFigure-Edit** or **FigureBench** helpful, please cite:
-
-```bibtex
-@misc{lin2026autofigureeditgeneratingeditablescientific,
-      title={AutoFigure-Edit: Generating Editable Scientific Illustration}, 
-      author={Zhen Lin and Qiujie Xie and Minjun Zhu and Shichen Li and Qiyao Sun and Enhao Gu and Yiran Ding and Ke Sun and Fang Guo and Panzhong Lu and Zhiyuan Ning and Yixuan Weng and Yue Zhang},
-      year={2026},
-      eprint={2603.06674},
-      archivePrefix={arXiv},
-      primaryClass={cs.CV},
-      url={https://arxiv.org/abs/2603.06674}, 
-}
-
-@dataset{figurebench2025,
-  title = {FigureBench: A Benchmark for Automated Scientific Illustration Generation},
-  author = {WestlakeNLP},
-  year = {2025},
-  url = {https://huggingface.co/datasets/WestlakeNLP/FigureBench}
-}
-```
-
-This project is licensed under the MIT License - see `LICENSE` for details.
+本项目 fork 自 [ResearAI/AutoFigure-Edit](https://github.com/ResearAI/AutoFigure-Edit)，遵循 MIT License。原始工作为 ICLR 2026 论文 *AutoFigure*；如果它对你的研究有帮助，请引用原论文并给上游仓库一个 Star。

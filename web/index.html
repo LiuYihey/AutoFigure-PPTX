@@ -142,10 +142,10 @@
             <div class="field-group">
               <label class="field-label" for="imageProvider">Image Provider</label>
               <select id="imageProvider" class="input">
-                <option value="gemini" selected>gemini</option>
+                <option value="gemini">gemini</option>
                 <option value="openrouter">openrouter</option>
                 <option value="anthropic">anthropic</option>
-                <option value="custom">custom (OpenAI Compatible)</option>
+                <option value="custom" selected>custom (OpenAI Compatible)</option>
               </select>
             </div>
 
@@ -161,7 +161,7 @@
 
             <div class="field-group">
               <label class="field-label" for="imageModel">Image Model</label>
-              <input id="imageModel" type="text" class="input" placeholder="gemini-3-pro-image-preview" />
+              <input id="imageModel" type="text" class="input" placeholder="gpt-image-2.6-sunburst / gpt-image-2.5-flare" value="gpt-image-2.6-sunburst" />
             </div>
           </div>
 
@@ -170,10 +170,10 @@
           <div class="field-group">
             <label class="field-label" for="svgProvider">SVG Provider</label>
             <select id="svgProvider" class="input">
-              <option value="anthropic" selected>anthropic</option>
+              <option value="anthropic">anthropic</option>
               <option value="gemini">gemini</option>
               <option value="openrouter">openrouter</option>
-              <option value="custom">custom (OpenAI Compatible)</option>
+              <option value="custom" selected>custom (OpenAI Compatible)</option>
             </select>
           </div>
 
@@ -189,7 +189,7 @@
 
           <div class="field-group">
             <label class="field-label" for="svgModel">SVG Model</label>
-            <input id="svgModel" type="text" class="input" placeholder="claude-sonnet-4-6-thinking / gemini-2.5-pro" />
+            <input id="svgModel" type="text" class="input" placeholder="claude-sonnet-5-5 / gemini-2.5-pro" value="claude-sonnet-5-5" />
           </div>
         </section>
 
@@ -200,6 +200,7 @@
       </main>
     </div>
 
+    <script src="/local-config.js"></script>
     <script src="/app.js"></script>
   </body>
 </html>
